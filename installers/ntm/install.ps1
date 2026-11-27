@@ -15,7 +15,8 @@ param(
     [int]$SourceTimeout = 3600,
     [switch]$Yes,
     [switch]$Json,
-    [switch]$Help
+    [switch]$Help,
+    [string]$ReleaseTag
 )
 
 Set-StrictMode -Version Latest
@@ -2132,7 +2133,10 @@ function Build-DsrRustSourceOutputs {
         $cargoVersion -cnotmatch '^cargo [0-9]' -or $cargoVersion.Length -gt 4096) {
         Stop-DsrInstall 'Invalid installed Rust compiler identity' 6
     }
-    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest) + $featureArguments
+    # Nonresolving metadata describes declared providers. A bare feature for
+    # build --package can belong only to that member, not the current root;
+    # applying it here would reject a valid build before package selection.
+    $metadataArguments = @('metadata', '--format-version=1', '--no-deps', '--locked', '--manifest-path', $manifest)
     $metadataText = Invoke-DsrSourceCommand @cargoBase -Arguments $metadataArguments -Log ([IO.Path]::Combine($Logs, 'cargo-metadata')) -Capture
     $metadata = ConvertFrom-DsrJson $metadataText
     if ($metadata -isnot [Collections.IDictionary] -or -not $metadata.Contains('version') -or $metadata.version -ne 1 -or
@@ -2147,7 +2151,9 @@ function Build-DsrRustSourceOutputs {
     $lock = [IO.Path]::Combine($workspace, 'Cargo.lock')
     $lockRelative = [IO.Path]::GetRelativePath($Source, $lock).Replace('\', '/')
     $manifestRelative = [IO.Path]::GetRelativePath($Source, $manifest).Replace('\', '/')
-    if ($lockRelative -cnotin $Files -or $manifestRelative -cnotin $Files) {
+    $workspaceManifest = Get-DsrPlainPath ([IO.Path]::Combine($workspace, 'Cargo.toml')) -File
+    $workspaceManifestRelative = [IO.Path]::GetRelativePath($Source, $workspaceManifest).Replace('\', '/')
+    if ($lockRelative -cnotin $Files -or $manifestRelative -cnotin $Files -or $workspaceManifestRelative -cnotin $Files) {
         Stop-DsrInstall 'Rust source installation requires a committed Cargo.toml and workspace Cargo.lock' 4
     }
     $null = Get-DsrPlainPath $lock -File
@@ -2159,10 +2165,16 @@ function Build-DsrRustSourceOutputs {
     } elseif ($Selection.binaries.Count -eq 1) {
         # Match cargo build's current-package/default-members behavior. A
         # complete multi-package family deliberately selects the workspace.
-        $current = @($packages | Where-Object { [IO.Path]::GetFullPath($_.manifest_path).Equals($manifest, $pathComparison) })
-        if ($current.Count -eq 1) { $packages = $current }
-        elseif ($metadata.Contains('workspace_default_members')) {
+        if ($manifest.Equals($workspaceManifest, $pathComparison) -and $metadata.Contains('workspace_default_members')) {
+            # An explicit workspace default-members selection also applies
+            # when the workspace root is itself a package.
             $packages = @($packages | Where-Object { $_.id -cin $metadata.workspace_default_members })
+        } else {
+            $current = @($packages | Where-Object { [IO.Path]::GetFullPath($_.manifest_path).Equals($manifest, $pathComparison) })
+            if ($current.Count -eq 1) { $packages = $current }
+            elseif ($metadata.Contains('workspace_default_members')) {
+                $packages = @($packages | Where-Object { $_.id -cin $metadata.workspace_default_members })
+            }
         }
     }
     $providers = @()
@@ -2207,6 +2219,19 @@ function Build-DsrRustSourceOutputs {
         if ($selected.Count -ne 1 -or $selected[0].package_id -cne $provider.package_id -or
             $selected[0].executable -isnot [string] -or -not $selected[0].executable) {
             Stop-DsrInstall ('Cargo did not produce one executable from its selected provider: ' + $provider.name) 6
+        }
+        $record = $selected[0]
+        if (-not $record.Contains('manifest_path') -or $record.manifest_path -isnot [string] -or
+            -not [IO.Path]::IsPathFullyQualified($record.manifest_path) -or
+            -not $record.target.Contains('src_path') -or $record.target.src_path -isnot [string] -or
+            -not [IO.Path]::IsPathFullyQualified($record.target.src_path)) {
+            Stop-DsrInstall ('Cargo executable lacks its admitted source identity: ' + $provider.name) 6
+        }
+        $builtManifest = Get-DsrPlainPath $record.manifest_path -File
+        $builtEntry = Get-DsrPlainPath $record.target.src_path -File
+        if (-not $builtManifest.Equals([IO.Path]::GetFullPath([IO.Path]::Combine($Source, $provider.manifest)), $pathComparison) -or
+            -not $builtEntry.Equals([IO.Path]::GetFullPath([IO.Path]::Combine($Source, $provider.entry)), $pathComparison)) {
+            Stop-DsrInstall ('Cargo executable changed its admitted source provider: ' + $provider.name) 6
         }
         $expected = [IO.Path]::Combine($targetDirectory, $target, 'release', $provider.name)
         $produced = Get-DsrPlainPath $selected[0].executable -File
@@ -2866,7 +2891,7 @@ function Invoke-DsrWindowsInstaller {
     param([string]$Version = '', [string]$Prefix = '', [string]$CacheDir = '',
           [switch]$Offline, [switch]$Recover, [switch]$FromSource, [switch]$AllowSourceBuild,
           [string]$SourceIfStale = '', [string]$SourceRef = '', [int]$SourceTimeout = 3600,
-          [switch]$Yes, [switch]$Json, [switch]$Help)
+          [switch]$Yes, [switch]$Json, [switch]$Help, [string]$ReleaseTag)
     $work = ''
     $retainSourceWork = $false
     $freshness = $null
@@ -2885,10 +2910,11 @@ function Invoke-DsrWindowsInstaller {
 Install $tool on native Windows using verified release payloads.
 
 Options:
-  -Version TAG   Exact tag (numeric 1.2.3 also accepts v1.2.3); default: latest
+  -Version VER   Install a version (1.2.3 selects v1.2.3); default: latest
+  -ReleaseTag TAG  Use the exact published tag, including an unprefixed 1.2.3
   -Prefix DIR    Destination directory; default: LocalAppData/Programs/$tool/bin
   -CacheDir DIR  Persistent verified download cache
-  -Offline       No network; requires -Version and complete cached evidence
+  -Offline       No network; requires -Version or -ReleaseTag and complete cached evidence
   -Recover       Restore an interrupted installation offline; requires -Yes
   -FromSource    Explicitly build a configured Rust/Go/Bun family with installed tools
   -AllowSourceBuild  Permit source fallback when release acquisition is unavailable
@@ -2917,6 +2943,13 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
             if ($Json) { [Console]::Out.WriteLine((@{ tool = $tool; status = 'help'; help = $text } | ConvertTo-Json -Compress)) }
             else { [Console]::Out.WriteLine($text) }
             return 0
+        }
+        $exactTag = $PSBoundParameters.ContainsKey('ReleaseTag')
+        if ($exactTag) {
+            if ($PSBoundParameters.ContainsKey('Version') -or -not (Test-DsrName $ReleaseTag)) {
+                Stop-DsrInstall 'Select one valid release tag with -ReleaseTag or one version with -Version'
+            }
+            $Version = $ReleaseTag
         }
         $platform = Get-DsrHostPlatform
         if (-not $policy.platforms.Contains($platform)) { Stop-DsrInstall ('No configured release for ' + $platform) 3 }
@@ -2959,7 +2992,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
             if ($Version -or $Offline) { Stop-DsrInstall '-FromSource cannot be combined with -Version or -Offline; select -SourceRef instead' }
             if (-not $SourceRef) { $SourceRef = 'HEAD' }
         }
-        if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version' }
+        if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version or -ReleaseTag' }
         if ($Version -and -not (Test-DsrName $Version)) { Stop-DsrInstall 'Invalid release version' }
         if (-not $CacheDir) { $CacheDir = [IO.Path]::Combine($localAppData, 'dsr', 'cache', 'installers') }
         $cacheRoot = Get-DsrPlainPath $CacheDir
@@ -3026,7 +3059,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
                 }
                 $tag = $release.tag_name
             }
-        } else { $tag = if ($Version -cmatch '^[0-9]') { 'v' + $Version } else { $Version } }
+        } else { $tag = if (-not $exactTag -and $Version -cmatch '^[0-9]') { 'v' + $Version } else { $Version } }
         $number = if ($tag.StartsWith('v', [StringComparison]::Ordinal)) { $tag.Substring(1) } else { $tag }
         $asset = $selection.name.Replace('${version}', $number)
         if (-not (Test-DsrWindowsName $asset)) { Stop-DsrInstall 'Resolved payload name is unsafe' }

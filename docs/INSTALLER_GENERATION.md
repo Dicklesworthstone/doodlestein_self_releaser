@@ -1383,6 +1383,12 @@ select a frozen earlier checkout for the same caller's before/after comparison.
 
 ## Repository-bound release caches
 
+Use `--release-tag 1.2.3` in Bash or `-ReleaseTag 1.2.3` in PowerShell when the
+repository publishes the literal tag `1.2.3`. The same selector reopens its
+verified cache offline. The existing `--version 1.2.3` and `-Version 1.2.3`
+shorthands select `v1.2.3`. Both tags can coexist and carry different binaries
+under the same asset filename.
+
 Ordinary installers reuse a cached release only for the same configured tool,
 repository, exact release tag, platform/compiler variant, archive format and
 literal asset name. A checksum sidecar authenticates the cached bytes against

@@ -15,7 +15,8 @@ param(
     [int]$SourceTimeout = 3600,
     [switch]$Yes,
     [switch]$Json,
-    [switch]$Help
+    [switch]$Help,
+    [string]$ReleaseTag
 )
 
 Set-StrictMode -Version Latest
@@ -1699,7 +1700,7 @@ function Invoke-DsrWindowsInstaller {
     param([string]$Version = '', [string]$Prefix = '', [string]$CacheDir = '',
           [switch]$Offline, [switch]$Recover, [switch]$FromSource, [switch]$AllowSourceBuild,
           [string]$SourceIfStale = '', [string]$SourceRef = '', [int]$SourceTimeout = 3600,
-          [switch]$Yes, [switch]$Json, [switch]$Help)
+          [switch]$Yes, [switch]$Json, [switch]$Help, [string]$ReleaseTag)
     $work = ''
     $retainSourceWork = $false
     $freshness = $null
@@ -1718,10 +1719,11 @@ function Invoke-DsrWindowsInstaller {
 Install $tool on native Windows using verified release payloads.
 
 Options:
-  -Version TAG   Exact tag (numeric 1.2.3 also accepts v1.2.3); default: latest
+  -Version VER   Install a version (1.2.3 selects v1.2.3); default: latest
+  -ReleaseTag TAG  Use the exact published tag, including an unprefixed 1.2.3
   -Prefix DIR    Destination directory; default: LocalAppData/Programs/$tool/bin
   -CacheDir DIR  Persistent verified download cache
-  -Offline       No network; requires -Version and complete cached evidence
+  -Offline       No network; requires -Version or -ReleaseTag and complete cached evidence
   -Recover       Restore an interrupted installation offline; requires -Yes
   -FromSource    Explicitly build a configured Rust/Go/Bun family with installed tools
   -AllowSourceBuild  Permit source fallback when release acquisition is unavailable
@@ -1750,6 +1752,13 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
             if ($Json) { [Console]::Out.WriteLine((@{ tool = $tool; status = 'help'; help = $text } | ConvertTo-Json -Compress)) }
             else { [Console]::Out.WriteLine($text) }
             return 0
+        }
+        $exactTag = $PSBoundParameters.ContainsKey('ReleaseTag')
+        if ($exactTag) {
+            if ($PSBoundParameters.ContainsKey('Version') -or -not (Test-DsrName $ReleaseTag)) {
+                Stop-DsrInstall 'Select one valid release tag with -ReleaseTag or one version with -Version'
+            }
+            $Version = $ReleaseTag
         }
         $platform = Get-DsrHostPlatform
         if (-not $policy.platforms.Contains($platform)) { Stop-DsrInstall ('No configured release for ' + $platform) 3 }
@@ -1792,7 +1801,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
             if ($Version -or $Offline) { Stop-DsrInstall '-FromSource cannot be combined with -Version or -Offline; select -SourceRef instead' }
             if (-not $SourceRef) { $SourceRef = 'HEAD' }
         }
-        if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version' }
+        if ($Offline -and -not $Version) { Stop-DsrInstall '-Offline requires an explicit -Version or -ReleaseTag' }
         if ($Version -and -not (Test-DsrName $Version)) { Stop-DsrInstall 'Invalid release version' }
         if (-not $CacheDir) { $CacheDir = [IO.Path]::Combine($localAppData, 'dsr', 'cache', 'installers') }
         $cacheRoot = Get-DsrPlainPath $CacheDir
@@ -1859,7 +1868,7 @@ explicit source fetches use the same token at that repository's HTTPS Git URL.
                 }
                 $tag = $release.tag_name
             }
-        } else { $tag = if ($Version -cmatch '^[0-9]') { 'v' + $Version } else { $Version } }
+        } else { $tag = if (-not $exactTag -and $Version -cmatch '^[0-9]') { 'v' + $Version } else { $Version } }
         $number = if ($tag.StartsWith('v', [StringComparison]::Ordinal)) { $tag.Substring(1) } else { $tag }
         $asset = $selection.name.Replace('${version}', $number)
         if (-not (Test-DsrWindowsName $asset)) { Stop-DsrInstall 'Resolved payload name is unsafe' }

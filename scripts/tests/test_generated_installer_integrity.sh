@@ -633,6 +633,7 @@ test_installer_cache_identity() {
     local identity_root="$work/cache-identity" identity_config="$DSR_CONFIG_DIR/repos.d/cache-demo.yaml"
     local shared_cache="$work/cache-identity/cache" label configured_repo pattern generated
     local first_installer second_installer renamed_installer identity_case identity_status
+    local -a selector=(--version v1.2.3)
     local identity_asset="cache-demo-1.2.3-$os-$arch.tar.gz" renamed_asset="cache-demo-1.2.3-$os-$arch.tar.gz.sha256"
     local REMOTE CALLS CURL_FAIL=0 GH_FAIL=1
     export REMOTE CALLS CURL_FAIL GH_FAIL
@@ -677,7 +678,7 @@ CONFIG
         REMOTE="$identity_root/$origin" CALLS="$identity_case/calls"
         : > "$CALLS"
         identity_status=0
-        bash "$selected" --version v1.2.3 --dir "$identity_case/bin" --cache-dir "$shared_cache" \
+        bash "$selected" "${selector[@]}" --dir "$identity_case/bin" --cache-dir "$shared_cache" \
             --non-interactive --json --no-skills "$@" > "$identity_case/out" 2> "$identity_case/err" || identity_status=$?
     }
     cache_identity_success() {
@@ -720,6 +721,27 @@ CONFIG
     cache_identity_install second-offline-after-rename "$second_installer" second --offline
     check 'sidecar-shaped payload name cannot overwrite the prior asset evidence' cache_identity_success second
     check 'previous literal asset reuse remains offline' test ! -s "$CALLS"
+
+    selector=(--release-tag 1.2.3)
+    cache_identity_install numeric-absent "$first_installer" second --offline
+    check 'numeric tag misses the prefixed cache on the same repository' cache_identity_refused
+    check 'numeric cache miss remains offline' test ! -s "$CALLS"
+    # Serve distinct, checksummed bytes under otherwise identical asset names.
+    cache_identity_install numeric-online "$first_installer" second
+    check 'explicit numeric tag installs its distinct executable' cache_identity_success second
+    check 'numeric tag selects its literal download URL' grep -qF \
+        "https://github.com/example/cache-first/releases/download/1.2.3/$identity_asset" "$CALLS"
+    cache_identity_install numeric-offline "$first_installer" second --offline
+    check 'numeric tag reinstalls from its own cache' cache_identity_success second
+    check 'cached numeric tag is reported literally' jq -e '.version == "1.2.3"' "$identity_case/out"
+    check 'numeric reinstall performs no network request' test ! -s "$CALLS"
+    selector=(--version 1.2.3)
+    cache_identity_install shorthand-offline "$first_installer" first --offline
+    check 'numeric version shorthand still selects prefixed bytes' cache_identity_success first
+    check 'shorthand reports the prefixed tag' jq -e '.version == "v1.2.3"' "$identity_case/out"
+    cache_identity_install conflicting-selectors "$first_installer" first --release-tag 1.2.3
+    check 'conflicting release selectors stop before acquisition' test "$identity_status" -eq 4
+    check 'conflicting selectors cannot request another release' test ! -s "$CALLS"
 }
 
 if [[ "${1:-}" == --cache-identity-only ]]; then

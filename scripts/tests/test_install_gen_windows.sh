@@ -407,7 +407,7 @@ def release(label, *, kind="good", checksum="SHA256SUMS", signed=True, selected=
     return downloads
 
 def run_case(label, downloads=None, *, selected_runtime=runtime, cache=None, prefix=None,
-             offline=False, version="1.2.3", yes=True, options=None, credentials=None, recover=False):
+             offline=False, version="1.2.3", release_tag=None, yes=True, options=None, credentials=None, recover=False):
     cache = Path(cache or root / ("cache-" + label))
     prefix = Path(prefix or root / ("prefix-" + label))
     requests = root / (label + ".requests")
@@ -418,6 +418,8 @@ def run_case(label, downloads=None, *, selected_runtime=runtime, cache=None, pre
         parameters["CacheDir"] = str(cache)
         if version is not None:
             parameters["Version"] = version
+        if release_tag is not None:
+            parameters["ReleaseTag"] = release_tag
         if offline:
             parameters["Offline"] = True
     spec = {"platform": "windows/amd64", "parameters": parameters,
@@ -1064,6 +1066,19 @@ for checksum, padding in (("sidecar", 98), ("checksums.sha256", 97)):
     check("private checksum fallback and complete " + ("singleton" if padding == 98 else "empty") + " final page",
           outcome.returncode == 0 and any(row["url"].endswith("page=2") for row in request_rows(observed)),
           outcome.stderr.decode(errors="replace"))
+
+numeric, numeric_result, _, _, numeric_requests = run_case("exact-numeric-tag",
+    release("numeric", version="1.2.3"), cache=good_cache, version=None, release_tag="1.2.3")
+check("exact numeric tag selects its own signed release despite an existing v1.2.3 cache",
+      numeric.returncode == 0 and numeric_result.get("version") == "1.2.3" and numeric_requests.is_file() and
+      all("/download/1.2.3/" in url for url in numeric_requests.read_text().splitlines()),
+      numeric.stderr.decode(errors="replace"))
+numeric_offline, details, _, _, requests = run_case("offline-numeric-tag", cache=good_cache,
+    version=None, release_tag="1.2.3", offline=True)
+check("literal numeric tag reinstalls offline", numeric_offline.returncode == 0 and
+      details.get("version") == "1.2.3" and details.get("signature_verified") is True and not requests.exists(),
+      numeric_offline.stderr.decode(errors="replace"))
+refusal("conflicting-release-selectors", version="1.2.3", release_tag="1.2.3", expected=4)
 
 named_tag = "release-2026.11"
 named, named_details, _, _, named_requests = run_case("named-public-tag", release("named-public", version=named_tag), version=named_tag)

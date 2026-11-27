@@ -7,7 +7,8 @@
 #   curl -sSfL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --json
 #
 # Options:
-#   -v, --version VERSION    Install specific version, e.g. 1.2.3 or v1.2.3 (default: latest)
+#   -v, --version VERSION    Install a version (1.2.3 selects v1.2.3; default: latest)
+#   --release-tag TAG        Use the exact published tag, including an unprefixed 1.2.3
 #   -d, --dir DIR            Installation directory (default: ~/.local/bin)
 #   -y, --yes                Replace an existing binary without asking
 #   --recover               With --yes: recover a stopped installation (Python 3 required)
@@ -18,7 +19,7 @@
 #   --json                   Output JSON for automation
 #   --non-interactive        No prompts, fail on missing consent
 #   --cache-dir DIR          Cache directory (default: ~/.cache/dsr/installers)
-#   --offline [ARCHIVE]      No network; requires --version and local checksum evidence
+#   --offline [ARCHIVE]      No network; requires --version or --release-tag and local checksum evidence
 #   --prefer-gh              Prefer gh release download for private repos
 #   --from-source            Build source instead of downloading (explicit code-execution consent)
 #   --allow-source-build     Allow source fallback when discovery/download is unavailable
@@ -6257,7 +6258,8 @@ Usage:
   curl -sSfL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --json
 
 Options:
-  -v, --version VERSION    Install specific version, e.g. 1.2.3 or v1.2.3 (default: latest)
+  -v, --version VERSION    Install a version (1.2.3 selects v1.2.3; default: latest)
+  --release-tag TAG        Use the exact published tag, including an unprefixed 1.2.3
   -d, --dir DIR            Installation directory (default: ~/.local/bin)
   -y, --yes                Replace an existing binary without asking
   --recover               With --yes: recover a stopped installation (Python 3 required)
@@ -6268,7 +6270,7 @@ Options:
   --json                   Output JSON for automation
   --non-interactive        No prompts, fail on missing consent
   --cache-dir DIR          Cache directory (default: ~/.cache/dsr/installers)
-  --offline [ARCHIVE]      No network; requires --version and local checksum evidence
+  --offline [ARCHIVE]      No network; requires --version or --release-tag and local checksum evidence
   --prefer-gh              Prefer gh release download for private repos
   --from-source            Build source instead of downloading (explicit code-execution consent)
   --allow-source-build     Allow source fallback when discovery/download is unavailable
@@ -6302,13 +6304,18 @@ DSR_INSTALLER_HELP
 # Main installation function
 main() {
     local prefer_stale=false stale_threshold=10 stale_threshold_set=false
-    local install_mode=vibe
+    local install_mode=vibe exact_tag=false
     local stale_threshold_pattern='^(0|[1-9][0-9]{0,5})$'
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -v|--version)
-                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _log_error "$1 requires a version"; return 4; }
+            -v|--version|--release-tag)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _log_error "$1 requires a version or tag"; return 4; }
+                if $exact_tag || { [[ "$1" == --release-tag ]] && [[ -n "$_VERSION" ]]; }; then
+                    _log_error "Choose one release selector: --version or --release-tag"
+                    return 4
+                fi
+                [[ "$1" != --release-tag ]] || exact_tag=true
                 _VERSION="$2"
                 shift 2
                 ;;
@@ -6481,7 +6488,7 @@ main() {
     fi
     # Release tags are v-prefixed; `-v 1.2.3` names the same release as
     # `-v v1.2.3` (download URL, gh download and offline cache key alike).
-    if [[ "$_VERSION" =~ ^[0-9] ]]; then
+    if ! $exact_tag && [[ "$_VERSION" =~ ^[0-9] ]]; then
         _VERSION="v$_VERSION"
     fi
     # Safe mode installs only the verified release binary.
@@ -6533,7 +6540,7 @@ main() {
     # Get version
     if [[ -z "$_VERSION" ]]; then
         if $_OFFLINE_MODE; then
-            _log_error "Offline installation requires --version; latest cannot be resolved without network"
+            _log_error "Offline installation requires --version or --release-tag; latest cannot be resolved without network"
             return 4
         fi
         _log_info "Fetching latest version..."

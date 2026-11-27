@@ -55,6 +55,8 @@ func main() { fmt.Println("default-source-v2") }
 GO
 "$GIT_REAL" -C "$TEMP/upstream" commit -qam next
 HEAD_PIN=$("$GIT_REAL" -C "$TEMP/upstream" rev-parse HEAD)
+# Numeric and v-prefixed tags name different commits in this repository.
+"$GIT_REAL" -C "$TEMP/upstream" tag 1.0.0 "$HEAD_PIN"
 export TAG_PIN HEAD_PIN FRESHNESS_MODE=normal FRESHNESS_COUNT=1
 export SOURCE_UPSTREAM="$TEMP/upstream"
 "$GIT_REAL" config --file "$GIT_CONFIG_GLOBAL" url."file://$TEMP/upstream".insteadOf https://github.com/example/source-app.git
@@ -752,6 +754,14 @@ test_acquisition_source_fallback() {
         fi
         check "$stage fallback installs a genuine executable" test -x "$CASE/install/app"
     done
+    label=acquisition-numeric-tag-fallback
+    if [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]]; then
+        ACQUISITION_FAILURE_STAGE=payload ACQUISITION_FAILURE=unavailable \
+            run_case "$label" good --allow-source-build --release-tag 1.0.0 --source-timeout 60
+        check 'numeric release fallback installs the distinct tagged Go commit' source_json "$HEAD_PIN"
+        check 'numeric release fallback records its literal ref and version' jq -e \
+            '.version == "1.0.0" and .source.requested_ref == "refs/tags/1.0.0"' "$CASE/out.json"
+    fi
     label=acquisition-payload-gh-ambiguous
     if [[ -z "${DSR_INSTALLER_ACQUISITION_TEST_FILTER:-}" || "$label" =~ $DSR_INSTALLER_ACQUISITION_TEST_FILTER ]]; then
         DSR_GH_TOKEN=acquisition-test-token ACQUISITION_FAILURE=gh-ambiguous \
