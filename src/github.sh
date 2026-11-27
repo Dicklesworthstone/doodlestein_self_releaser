@@ -36,7 +36,7 @@ GH_CACHE_TTL="${GH_CACHE_TTL:-60}"  # seconds
 GH_MAX_RETRIES="${GH_MAX_RETRIES:-3}"
 GH_RETRY_DELAY="${GH_RETRY_DELAY:-5}"  # seconds
 
-# Last HTTP response metadata (curl path)
+# Last HTTP response metadata (shared by gh and curl)
 _GH_LAST_HTTP_CODE=""
 _GH_LAST_ETAG=""
 _GH_LAST_RETRY_AFTER=""
@@ -410,7 +410,7 @@ gh_api() (
         fi
     fi
 
-    # Reset last response metadata (set by curl path)
+    # Reset last response metadata before selecting either transport.
     _GH_LAST_HTTP_CODE=""
     _GH_LAST_ETAG=""
 
@@ -487,8 +487,8 @@ gh_api() (
                 rate_limited=true
             elif [[ "$method" == GET && -z "${_GH_LAST_HTTP_CODE:-}" ]] &&
                  _gh_is_rate_limited "$response"; then
-                # gh's JSON-only transport does not expose response headers. A
-                # reported rate limit may retry a read, but not a mutation whose
+                # A failed read with no complete HTTP response may still report
+                # a rate limit. Never apply this fallback to a mutation whose
                 # rejection status and server cooldown cannot be established.
                 rate_limited=true
             fi
@@ -496,7 +496,7 @@ gh_api() (
 
         # Check for rate limit
         if [[ $exit_code -eq 0 ]]; then
-            # Handle 304 Not Modified from curl path
+            # Both transports can revalidate an expired cache with a 304.
             if [[ "${_GH_LAST_HTTP_CODE:-}" == "304" ]]; then
                 local cached_raw
                 if [[ "$method" == "GET" ]] && ! $no_cache &&
@@ -994,20 +994,54 @@ _gh_api_with_gh() {
     local data="$3"
     local no_cache="${4:-false}"
 
-    local gh_args=(api "$endpoint" --hostname github.com -X "$method")
+    # Keep HTTP status and cooldown headers for the common retry policy. Body
+    # text alone cannot establish that GitHub rejected a release mutation, and
+    # dropping Retry-After would repeat throttled reads before their deadline.
+    local gh_args=(api "$endpoint" --hostname github.com -X "$method" --include)
     if $no_cache; then
         gh_args+=(
             -H "Cache-Control: no-cache, no-store, max-age=0"
             -H "Pragma: no-cache"
         )
+    elif [[ "$method" == GET ]]; then
+        local etag
+        etag=$(_gh_get_etag "$endpoint")
+        [[ -z "$etag" ]] || gh_args+=(-H "If-None-Match: $etag")
     fi
 
     if [[ -n "$data" ]]; then
         gh_args+=(--input -)
-        echo "$data" | secrets_run_gh "${gh_args[@]}" 2>/dev/null
-    else
-        secrets_run_gh "${gh_args[@]}" 2>/dev/null
     fi
+    local raw status=0 response_status=0
+    # The sentinel preserves trailing body bytes, including empty 204/304
+    # responses and the exact original draft response retained by gh_api.
+    raw=$(
+        # Machine-readable headers and exact response bytes must not inherit
+        # the operator's terminal colors, JSON pretty printing, or pager.
+        unset GH_FORCE_TTY || exit 4
+        NO_COLOR=1 CLICOLOR=0 CLICOLOR_FORCE=0 GH_PAGER=cat \
+            secrets_run_gh "${gh_args[@]}" < <(printf '%s' "$data") 2>/dev/null
+        status=$?; printf '\034'; exit "$status") || status=$?
+    raw="${raw%$'\034'}"
+    if ((status != 0 && status != 1)); then
+        # Cancellation/authentication/supervisor errors stay terminal even if
+        # stdout happens to contain a complete, retryable HTTP error response.
+        printf '%s' "$raw"
+        return "$status"
+    fi
+    if [[ "$raw" != HTTP/* ]]; then
+        printf '%s' "$raw"
+        # A transport failure may have no response. A successful --include
+        # invocation without headers cannot establish a successful API call.
+        ((status != 0)) || return 8
+        return "$status"
+    fi
+    _gh_api_parse_response "$raw" || response_status=$?
+    # gh reports HTTP errors as 1. Preserve that public status while passing
+    # the parsed HTTP code to gh_api, which alone decides whether to retry.
+    # A failed CLI with a 2xx body still has an uncertain outcome.
+    ((status == 0)) || return "$status"
+    return "$response_status"
 }
 
 # Make API request using curl
@@ -1061,7 +1095,7 @@ _gh_api_with_curl() {
         curl_args+=(--data-binary @-)
     fi
 
-    local raw headers body status_line http_code etag
+    local raw
     local curl_status=0
     # Preserve trailing header separators on body-less 204/304 responses.
     # Command substitution otherwise strips the final newline in CRLFCRLF.
@@ -1073,14 +1107,25 @@ _gh_api_with_curl() {
         return $curl_status
     fi
 
-    # curl -D - may include a proxy CONNECT response and interim 1xx
-    # responses. Only the final header block describes the JSON body.
-    body="$raw"
+    _gh_api_parse_response "$raw"
+}
+
+# Both transports expose a final HTTP response followed by untouched JSON
+# bytes. curl can also include proxy CONNECT and interim 1xx responses. Only
+# the final complete header block supplies cache and retry metadata; never
+# search a JSON body for an HTTP status or strip its trailing newlines.
+_gh_api_parse_response() {
+    local body="$1" headers status_line http_code etag
     http_code=""
     while [[ "$body" == HTTP/* ]]; do
         if [[ "$body" == *$'\r\n\r\n'* ]]; then
             headers="${body%%$'\r\n\r\n'*}"
             body="${body#*$'\r\n\r\n'}"
+        elif [[ "$body" == *$'\n\r\n'* ]]; then
+            # gh prints its status line with LF, then a CRLF separator. With
+            # no header fields (for example a 204), that is the whole block.
+            headers="${body%%$'\n\r\n'*}"
+            body="${body#*$'\n\r\n'}"
         elif [[ "$body" == *$'\n\n'* ]]; then
             headers="${body%%$'\n\n'*}"
             body="${body#*$'\n\n'}"
@@ -1855,8 +1900,8 @@ gh_upload_asset_named() (
         else
             file_dir=${file_path%/*}
             [[ "$file_dir" != "$file_path" ]] || file_dir=.
-            file_dir=$(CDPATH= cd -- "${file_dir:-/}" && pwd -P) || return 4
-            root_dir=$(CDPATH= cd -- "$directory" && pwd -P) || return 4
+            file_dir=$(CDPATH='' cd -- "${file_dir:-/}" && pwd -P) || return 4
+            root_dir=$(CDPATH='' cd -- "$directory" && pwd -P) || return 4
             [[ "$file_dir" == "$root_dir" ]] || return 4
         fi
     fi
@@ -2289,6 +2334,7 @@ gh_clear_cache() {
 # Export functions
 export -f gh_init_cache gh_check gh_check_token gh_require_auth _gh_resolve_token gh_api
 export -f _gh_api_timeout _gh_check_cli_auth _gh_api_attempt _gh_api_with_gh _gh_api_with_curl
+export -f _gh_api_parse_response
 export -f _gh_response_retention_directory
 export -f _gh_cache_key _gh_get_cache _gh_get_cache_raw _gh_get_etag _gh_set_cache _gh_is_rate_limited
 export -f _gh_log_info _gh_log_debug

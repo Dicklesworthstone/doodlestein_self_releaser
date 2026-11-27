@@ -494,6 +494,7 @@ create_strict_github_mocks() {
                 ;;
             api)
                 local endpoint="${2:-}"
+                [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
                 local method="GET"
                 local has_input=false
                 local input_json=""

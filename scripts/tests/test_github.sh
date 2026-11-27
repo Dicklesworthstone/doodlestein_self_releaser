@@ -457,7 +457,7 @@ test_credential_transport_routing() (
       api\ *)
         printf 'GH %s %s\n' "$host" "$token" >> "$calls"
         if [[ "$2" == */releases/assets/* ]]; then printf 'credential-payload\000\001'
-        else printf '{"authenticated":true}\n'; fi ;;
+        else printf 'HTTP/2.0 200 OK\r\n\r\n{"authenticated":true}\n'; fi ;;
       *) return 4 ;;
     esac
   }
@@ -551,11 +551,18 @@ test_api_retains_original_draft_response() (
   local wire_response=$'{\n  "id": 9, "tag_name": "v1.2.3", "name": "v1.2.3",\n  "body": "owned", "draft": true, "prerelease": false, "assets": []\n}\n\n'
   mkdir -m 700 "$private" || return 1
   export TMPDIR="$private"
-  gh() { return 0; }
-  _gh_api_with_gh() {
+  export GH_FORCE_TTY=80 NO_COLOR='' CLICOLOR=1 CLICOLOR_FORCE=1 GH_PAGER='fixture-pager'
+  gh() {
+    [[ "$1 ${2:-}" != 'auth status' ]] || return 0
+    [[ " $* " == *' --include '* ]] || return 99
+    [[ "${GH_FORCE_TTY-unset}" == unset && "$NO_COLOR" == 1 && "$CLICOLOR" == 0 &&
+       "$CLICOLOR_FORCE" == 0 && "$GH_PAGER" == cat ]] || return 98
+    printf 'HTTP/2.0 201 Created\r\nContent-Type: application/json\r\n\r\n'
     printf '%s' "$wire_response"
   }
   result=$(gh_create_release owner/app v1.2.3 --body owned --draft --retain-response) || return 1
+  [[ "$GH_FORCE_TTY" == 80 && "$NO_COLOR" == '' && "$CLICOLOR" == 1 &&
+     "$CLICOLOR_FORCE" == 1 && "$GH_PAGER" == fixture-pager ]] || return 1
   local -a receipts=("$private"/dsr-api-response.????????)
   [[ ${#receipts[@]} -eq 1 && -f "${receipts[0]}" ]] || return 1
   [[ "$(cat "${receipts[0]}")" == "$result" ]] || return 1
@@ -671,8 +678,9 @@ if os.environ['DSR_LARGE_API_RESPONSE'] == 'changed-body':
     response['body'] += 'unrelated response'
 wire = b' \n' + json.dumps(response, ensure_ascii=False, indent=2).encode() + b'\n\n'
 (case / 'wire.json').write_bytes(wire)
-if transport == 'curl':
-    sys.stdout.buffer.write(b'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n')
+if transport == 'gh':
+    assert '--include' in args
+sys.stdout.buffer.write(b'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n')
 sys.stdout.buffer.write(wire)
 PY
   chmod 755 "$TEMP_DIR/api.py" || return 1
@@ -775,7 +783,7 @@ test_api_no_cache_sends_headers_on_gh_cli() {
       return 0
     fi
     printf '%s\n' "$*" > "$gh_log"
-    printf '{"fresh":true}\n'
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"fresh":true}\n'
   }
 
   local result status=0
@@ -943,6 +951,121 @@ test_api_transport_scenario() (
 # gh emits JSON without HTTP status/headers. Exercise its real adapter and
 # credential wrapper, replacing only the external CLI. A failed write must
 # retain the original status and body, even if that body reports a rate limit.
+# Exercise the public adapter through gh's documented --include boundary.
+# The fixture deliberately emits only the body when headers were not requested,
+# reproducing the lost status/cooldown information in the historical adapter.
+test_api_gh_http_scenario() (
+  local scenario="$1" expected_status="$2" expected_attempts="$3" expected_wait="${4:-}"
+  local endpoint='repos/owner/repo/releases/9' method=POST status=0 count result
+  local fixture="$TEMP_DIR/gh-http" code=429 headers=$'Retry-After: 7\r\n'
+  local body='{"message":"slow down"}' cli_status=1 expected_body='{"fresh":true}'
+  local GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_MAX_RETRY_WAIT=300 DSR_GH_TOKEN=fixture-token
+  mkdir -p "$fixture/tmp" || return 1
+  local TMPDIR="$fixture/tmp"
+  : > "$fixture/calls"
+  printf '0\n' > "$fixture/attempts"
+  case "$scenario" in
+    get-503) method=GET; code=503; headers=''; body='{"message":"Unavailable"}' ;;
+    get-429) method=GET ;;
+    post-403) code=403 ;;
+    post-403-reset) code=403; headers=$'X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000011\r\n' ;;
+    post-503) code=503; headers=''; body='{"message":"API rate limit exceeded"}' ;;
+    post-uncertain) code=201; headers=''; body='{"fresh":true}' ;;
+    post-forbidden) code=403; headers=''; body='{"message":"Forbidden"}' ;;
+    post-rate-text) code=201; cli_status=0; headers=''; body='{"body":"rate limit improvements"}'; expected_body="$body" ;;
+    post-cancel) cli_status=130 ;;
+    post-timeout) cli_status=124 ;;
+    get-long-wait) method=GET; headers=$'Retry-After: 3600\r\n' ;;
+    get-invalid-wait) method=GET; headers=$'Retry-After: invalid\r\n' ;;
+    get-missing-header|get-incomplete-header) method=GET; code=200; cli_status=0; body='{"fresh":true}' ;;
+    get-etag) method=GET; code=200; cli_status=0; headers=$'ETag: W/"fresh"\r\n'; body='{"fresh":true}' ;;
+    get-304)
+      method=GET; code=304; cli_status=0; headers=$'ETag: W/"fresh"\r\n'; body=''
+      expected_body='{"cached":true}'
+      printf '%s\n' "$expected_body" | _gh_set_cache "$endpoint" 'W/"old"' || return 1
+      printf '0\nW/"old"\n' > "$GH_CACHE_DIR/$(_gh_cache_key "$endpoint").meta" || return 1 ;;
+    post-204) code=204; cli_status=0; headers=''; body=''; expected_body='' ;;
+  esac
+  date() { if [[ "$*" == +%s ]]; then printf '1700000000\n'; else command date "$@"; fi; }
+  sleep() { printf 'WAIT %s\n' "$1" >> "$fixture/calls"; }
+  gh() {
+    [[ "$1 ${2:-}" != 'auth status' ]] || return 0
+    [[ "$1" == api && "$2" == "$endpoint" ]] || return 99
+    printf 'REQUEST %s\n' "$*" >> "$fixture/calls"
+    local attempt include=false arg
+    for arg in "$@"; do [[ "$arg" != --include ]] || include=true; done
+    if [[ "$scenario" == get-304 ]]; then
+      [[ " $* " == *' If-None-Match: W/"old" '* ]] || return 99
+    fi
+    read -r attempt < "$fixture/attempts"
+    attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$fixture/attempts"
+    if ((attempt == 1)); then
+      if $include && [[ "$scenario" != get-missing-header ]]; then
+        # gh uses LF after the status line, CRLF for headers and the blank
+        # delimiter (cli/cli pkg/cmd/api/api.go processResponse).
+        printf 'HTTP/2.0 %s\n%s' "$code" "$headers"
+        [[ "$scenario" != get-incomplete-header ]] || return 0
+        printf '\r\n'
+      fi
+      printf '%s' "$body"
+      return "$cli_status"
+    fi
+    $include && printf 'HTTP/2.0 200 OK\nETag: W/"fresh"\r\n\r\n'
+    printf '%s' "$expected_body"
+  }
+  local -a args=("$endpoint")
+  [[ "$method" != POST ]] || args+=(--post '{}')
+  result=$(gh_api "${args[@]}" 2> "$fixture/stderr") || status=$?
+  read -r count < "$fixture/attempts"
+  if [[ "$status" != "$expected_status" || "$count" != "$expected_attempts" ]]; then
+    printf 'FAIL gh HTTP %s: status=%s requests=%s expected=%s/%s\n' \
+      "$scenario" "$status" "$count" "$expected_status" "$expected_attempts"
+    cat "$fixture/stderr"
+    return 1
+  fi
+  if [[ -n "$expected_wait" ]]; then
+    [[ "$(grep '^WAIT ' "$fixture/calls")" == "WAIT $expected_wait" ]] || return 1
+  else
+    ! grep -q '^WAIT ' "$fixture/calls" || return 1
+  fi
+  if ((status == 0)); then
+    [[ "$result" == "$expected_body" ]] || return 1
+    if [[ "$method" == GET ]]; then
+      [[ "$(_gh_get_cache "$endpoint")" == "$expected_body" &&
+         "$(_gh_get_etag "$endpoint")" == 'W/"fresh"' ]] || return 1
+    fi
+  else
+    ! _gh_get_cache "$endpoint" >/dev/null || return 1
+  fi
+  [[ -z "$(find "$fixture/tmp" -mindepth 1 -print -quit)" ]]
+)
+
+run_api_gh_http_regressions() {
+  local scenario status attempts wait
+  while read -r scenario status attempts wait; do
+    run_test "api_gh_http_$scenario" test_api_gh_http_scenario "$scenario" "$status" "$attempts" "$wait"
+  done <<'GH_HTTP_SCENARIOS'
+get-503 0 2 0
+get-429 0 2 7
+post-429 0 2 7
+post-403 0 2 7
+post-403-reset 0 2 11
+post-503 1 1
+post-uncertain 1 1
+post-forbidden 1 1
+post-rate-text 0 1
+post-cancel 130 1
+post-timeout 124 1
+get-long-wait 8 1
+get-invalid-wait 8 1
+get-missing-header 8 1
+get-incomplete-header 8 1
+get-etag 0 1
+get-304 0 1
+post-204 0 1
+GH_HTTP_SCENARIOS
+}
+
 test_api_gh_retry_scenario() (
   local scenario="$1" expected_status="$2" expected_attempts="$3"
   local fixture="$TEMP_DIR/gh-api" endpoint='repos/owner/repo/releases/9'
@@ -974,7 +1097,7 @@ test_api_gh_retry_scenario() (
       printf '%s\n' "$failure_body"
       return "$failure_status"
     fi
-    printf '{"fresh":true}\n'
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"fresh":true}\n'
   }
   local -a args=("$endpoint")
   [[ "$method" != POST ]] || args+=(--post '{}')
@@ -998,6 +1121,7 @@ test_api_gh_retry_scenario() (
 )
 
 run_api_retry_regressions() {
+  run_api_gh_http_regressions
   run_test rate_limit_errors_are_structured test_rate_limit_errors_are_structured
   local scenario status attempts
   while read -r scenario status attempts; do
@@ -1078,6 +1202,7 @@ gh() {
         esac
     fi
     printf 'request\n' >> "$DSR_TEST_API_CASE/requests"
+    printf 'HTTP/2.0 201 Created\r\n\r\n'
     printf '{"id":9,"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[]}\n\n'
     [[ "$DSR_TEST_API_PHASE" != gh ]] || stall
 }
@@ -1177,6 +1302,7 @@ test_exported_api_scenario() (
       return $?
     fi
     printf 'REQUEST\n' >> "$DSR_TEST_API_EXPORT_DIR/exported.calls"
+    printf 'HTTP/2.0 200 OK\r\n\r\n'
     if [[ "$DSR_TEST_API_EXPORT_CASE" == retain-post ]]; then
       printf '{\n  "id":9,"tag_name":"v1.2.3","name":"v1.2.3",\n  "body":"owned","draft":true,"prerelease":false,"assets":[]\n}\n\n'
     else
@@ -2086,6 +2212,7 @@ test_release_upload_scenario() (
     case "${2:-}" in
       repos/owner/repo/releases/9/assets\?per_page=100\&page=*)
         [[ "$scenario" == inventory-error ]] && return 1
+        printf 'HTTP/2.0 200 OK\r\n\r\n'
         if [[ "$scenario" == malformed-inventory ]]; then printf '{}\n'; return 0; fi
         if [[ "$scenario" == multiple-inventories ]]; then printf '[]\n[]\n'; return 0; fi
         if [[ "$scenario" == paginated || "$scenario" == inventory-tail-fails || "$scenario" == overlapping-pages ]]; then
@@ -3313,6 +3440,13 @@ PY
 main() {
   echo "=== github.sh Tests ==="
   echo ""
+
+  if [[ "${1:-}" == --api-gh-http-only ]]; then
+    run_api_gh_http_regressions
+    printf 'GitHub CLI HTTP metadata: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
 
   if [[ "${1:-}" == --workflow-interruption-only ]]; then
     run_workflow_interruption_tests

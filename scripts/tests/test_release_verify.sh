@@ -151,6 +151,7 @@ create_mock_gh() {
                 ;;
             api)
                 if [[ "$VERIFY_MOCK_API_STATUS" == "0" && "$*" == *"/releases/tags/"* ]]; then
+                    [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
                     printf '%s\n' "$VERIFY_MOCK_RELEASE_JSON"
                     return 0
                 fi
@@ -442,6 +443,7 @@ create_strict_verify_mock_gh() {
             api)
                 local endpoint="${2:-}"
                 local method="GET"
+                [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
                 [[ "$*" == *"-X PATCH"* ]] && method="PATCH"
                 [[ "$*" == *"-X DELETE"* ]] && method="DELETE"
                 case "$endpoint" in
@@ -709,6 +711,7 @@ create_strict_verify_fix_mock_gh() {
                 if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
                     _verify_fix_custody_boundary "$endpoint" || return $?
                 fi
+                [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
                 local method="GET" api_arg accept_octet_stream=false
                 shift 2
                 while [[ $# -gt 0 ]]; do
@@ -2828,6 +2831,7 @@ create_ordinary_verify_repair_mock() {
                 if [[ -n "${VERIFY_FIX_CUSTODY_ROOT:-}" ]]; then
                     _verify_fix_custody_boundary "${2:-}" || return $?
                 fi
+                [[ " $* " != *' --include '* ]] || printf 'HTTP/2.0 200 OK\r\n\r\n'
                 case "${2:-}" in
                     repos/testuser/test-tool/git/ref/tags/v1.0.0)
                         case "$ORDINARY_REPAIR_MODE" in

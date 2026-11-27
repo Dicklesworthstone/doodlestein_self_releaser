@@ -199,6 +199,7 @@ if [[ "$1" == auth ]]; then
 fi
 if [[ "$1" == api ]]; then
     [[ -s "$TEST_TMPDIR/runs.json" ]] || { echo 'gh: Bad gateway (HTTP 502)' >&2; exit 1; }
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
     if [[ "$2" =~ ^repos/Dicklesworthstone/ntm/actions/runs/([0-9]+)(/attempts/[0-9]+)?/jobs\? ]]; then
         jq -e --arg id "${BASH_REMATCH[1]}" '.workflow_runs | any(.[];
             (.id | tostring) == $id and .status == "queued")' "$TEST_TMPDIR/runs.json" >/dev/null || exit 99
@@ -283,6 +284,7 @@ done
 if [[ "$endpoint" =~ /runs/([0-9]+)(/attempts/[0-9]+)?/jobs\? ]]; then
     jq -e --arg id "${BASH_REMATCH[1]}" 'any(.[];
         (.id | tostring) == $id and .status == "queued")' "$TEST_TMPDIR/active-history.json" >/dev/null || exit 99
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
     printf '%s\n' '{"total_count":0,"jobs":[]}'
     exit 0
 fi
@@ -294,9 +296,11 @@ limit=20
 page=$(sed -nE 's/.*[?&]page=([0-9]+).*/\1/p' <<< "$endpoint")
 [[ -n "$page" ]] || page=1
 if [[ "$ACTIVE_FIXTURE_CASE" == later-error && "$desired" == queued && "$page" -eq 2 ]]; then
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 502 Bad Gateway\r\n\r\n'
     echo 'gh: Bad gateway (HTTP 502)' >&2
     exit 1
 fi
+[[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
 jq --arg desired "$desired" --arg mode "$ACTIVE_FIXTURE_CASE" \
     --argjson page "$page" --argjson limit "$limit" '
     map(select($desired == "" or .status == $desired)) as $all |
@@ -458,9 +462,11 @@ if [[ "$endpoint" == *'/jobs?'* ]]; then
     page=$(sed -nE 's/.*[?&]page=([0-9]+).*/\1/p' <<< "$endpoint")
     [[ -n "$page" ]] || exit 99
     if [[ "$JOB_FIXTURE_CASE" == later-error && "$page" == 2 ]]; then
+        [[ " $* " != *' --include '* ]] || printf 'HTTP/2 502 Bad Gateway\r\n\r\n'
         echo 'gh: Bad gateway (HTTP 502)' >&2
         exit 1
     fi
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
     jq --arg mode "$JOB_FIXTURE_CASE" --argjson page "$page" '
         {total_count:length,jobs:.[(($page-1)*100):($page*100)]} |
         if $mode == "cap" then .total_count=1001
@@ -469,6 +475,7 @@ if [[ "$endpoint" == *'/jobs?'* ]]; then
         elif $mode == "duplicate" and $page == 2 then .jobs[0].id=1
         else . end' "$TEST_TMPDIR/job-history.json"
 elif [[ "$endpoint" == *status=in_progress* || "$endpoint" == *status=queued* ]]; then
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
     desired=queued
     [[ "$endpoint" != *status=in_progress* ]] || desired=in_progress
     jq --arg desired "$desired" '.workflow_runs | map(select(.status == $desired)) |
@@ -643,6 +650,7 @@ for arg in "$@"; do [[ "$arg" == repos/*/actions/* ]] && endpoint="$arg"; done
 if [[ "$endpoint" =~ /runs/([0-9]+)/attempts/2/jobs\? ]]; then
     run_id="${BASH_REMATCH[1]}"
     if [[ "$run_id" == 101 || "$run_id" == 301 ]]; then
+        [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
         printf '%s\n' '{"total_count":0,"jobs":[]}'
         exit 0
     fi
@@ -651,6 +659,7 @@ if [[ "$endpoint" =~ /runs/([0-9]+)/attempts/2/jobs\? ]]; then
             cancel-jobs|cross-repo-cancel|queued-cancel)
                 # Emit valid bytes before a real process signal or explicit
                 # cancellation; the API status must still withdraw admission.
+                [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
                 printf '%s\n' '{"total_count":0,"jobs":[]}'
                 if [[ -n "${INDEPENDENT_CANCEL_SIGNAL:-}" ]]; then
                     ulimit -c 0
@@ -664,9 +673,12 @@ raise SystemExit(99)' "$INDEPENDENT_CANCEL_SIGNAL"
                 fi
                 exit "${INDEPENDENT_CANCEL_CODE:-2}" ;;
             wrong-source|wrong-attempt|invalid-time|malformed|short-page|recovered) ;;
-            *) printf 'gh: Bad gateway (HTTP 502)\n' >&2; exit 1 ;;
+            *)
+                [[ " $* " != *' --include '* ]] || printf 'HTTP/2 502 Bad Gateway\r\n\r\n'
+                printf 'gh: Bad gateway (HTTP 502)\n' >&2; exit 1 ;;
         esac
     fi
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
     jq -n --argjson run "$run_id" --arg mode "$INDEPENDENT_JOB_CASE" '
         def job($id;$status):
             {id:$id,run_id:$run,run_attempt:2,status:$status,head_sha:("1"*40),
@@ -686,6 +698,7 @@ elif [[ "$endpoint" == *status=queued* || "$endpoint" == *status=in_progress* ]]
     if [[ "$INDEPENDENT_JOB_CASE" == cancel-active && "$endpoint" == *status=in_progress* ]]; then
         exit "${INDEPENDENT_CANCEL_CODE:-2}"
     fi
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
     tool=ntm
     [[ "$endpoint" != repos/Dicklesworthstone/beads_viewer/* ]] || tool=bv
     desired=queued
@@ -1508,6 +1521,7 @@ fi
 if [[ "$1" == api && "$2" == repos/Dicklesworthstone/ntm/actions/runs/12345 ]]; then
     printf '%s\n' "$*" >> "$TEST_TMPDIR/watch-upstream.calls"
     [[ "${DSR_WATCH_UPSTREAM_ERROR:-false}" != true ]] || exit 1
+    [[ " $* " != *' --include '* ]] || printf 'HTTP/2 200 OK\r\n\r\n'
     cat "$TEST_TMPDIR/watch-upstream.json"
     exit "${DSR_WATCH_UPSTREAM_STATUS:-0}"
 fi
@@ -3283,6 +3297,7 @@ EOF
     fi
     if [[ "$1" == api ]]; then
         printf "%s\n" "$2" >> "$TEST_TMPDIR/watch-upstream.calls"
+        [[ " $* " != *" --include "* ]] || printf "HTTP/2 200 OK\r\n\r\n"
         case "$2" in
             repos/Dicklesworthstone/ntm/actions/runs/12345)
                 cat "$TEST_TMPDIR/watch-upstream.json"; exit 0 ;;
