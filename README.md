@@ -1514,6 +1514,7 @@ Full pipeline: check → build → release.
 dsr fallback --repo ntm --version v1.2.3        # One command does it all
 dsr fallback --repo ntm --version v1.2.3 --jobs 3  # Build up to three targets concurrently
 dsr fallback --repo ntm --version v1.3.0-rc.1 --prerelease
+dsr fallback --repo ntm --version v1.3.0 --draft
 ```
 
 Target builds run serially by default. `--parallel` (or `-p`) selects two targets,
@@ -1523,6 +1524,14 @@ host capacity and shared output paths. Resume may select a new concurrency bound
 while retaining verified completed targets. The complete configured target set,
 quality checks and publication requirements still apply. JSON results and
 dry-run plans report the selected bound in `details.parallel_jobs`.
+
+Use `--draft` to upload the verified assets for review before they become
+public. A successful fallback reports the release ID and observed visibility
+in `details.release`. Combine `--draft --prerelease` to stage a prerelease.
+Repeat both choices when resuming a strict build. Its recovery record retains
+the original creation response for a later explicit `dsr release finalize`.
+To publish an ordinary draft that DSR created, use `dsr release TOOL VERSION
+--artifacts DIR --resume --publish-draft` with its original artifact directory.
 
 Add `--prerelease` to require prerelease publication. A version suffix such as
 `-rc.1` does not select this mode automatically. Both `fallback` and `release`

@@ -24,6 +24,23 @@
       "type": "boolean",
       "description": "Whether --prerelease explicitly requires prerelease publication"
     },
+    "draft_requested": {
+      "type": "boolean",
+      "description": "Whether this manual fallback explicitly requested a private release for review"
+    },
+    "release": {
+      "type": "object",
+      "required": ["repo", "tag", "id", "draft", "prerelease"],
+      "properties": {
+        "repo": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "draft": { "type": "boolean" },
+        "prerelease": { "type": "boolean" }
+      },
+      "additionalProperties": false,
+      "description": "Identity and visibility confirmed by the completed release step"
+    },
     "prerelease": {
       "type": "boolean",
       "description": "Selected prerelease mode in plans and failures; observed mode after successful publication. Ordinary retries without --prerelease preserve an existing release's mode."

@@ -14842,6 +14842,7 @@ cmd_fallback() {
     # not rewrite configuration or change the hashes frozen in build receipts.
     local _ACT_ISOLATED_SOURCE_TOOL="" _ACT_ISOLATED_SOURCE_PATHS='{}' _ACT_ISOLATED_SOURCE_IDENTITY=null
     local build_only=false skip_checks=false resume=false
+    local keep_draft=false confirmed_release=null
     local prerelease=false prerelease_requested=false
     local dry_run="$DRY_RUN" output_dir_explicit=false
     local parallel_jobs=1
@@ -14882,6 +14883,7 @@ cmd_fallback() {
                 shift
                 ;;
             --build-only) build_only=true; shift ;;
+            --draft) keep_draft=true; shift ;;
             --prerelease) prerelease=true; prerelease_requested=true; shift ;;
             --parallel|-p)
                 parallel_jobs="${DSR_BUILD_PARALLELISM:-2}"; shift ;;
@@ -14920,6 +14922,7 @@ OPTIONS:
     --sbom / --no-sbom     Enable or disable SBOMs for ordinary publication
     --sbom-format <format> Select an SBOM format and enable its generation
     --build-only           Build and verify artifacts without publishing
+    --draft                Upload and verify a draft for manual review
     --prerelease           Publish as a prerelease; retain this choice on strict resume
     -p, --parallel[=N]     Build targets concurrently (default bound: 2)
     --jobs <N>             Explicit target concurrency bound (1-32)
@@ -14947,6 +14950,8 @@ DESCRIPTION:
     Strict retries recover only this build's preserved original draft creation
     custody. Missing assets are added without replacement, then the existing
     signed finalizer verifies and publishes the owned draft without dispatch.
+    An explicit --draft keeps it private. Repeat --draft when resuming that
+    strict attempt; retain its creation response for manual finalization.
     Missing original POST responses, changed inputs, and unrelated drafts block.
     Watcher workers revalidate their exact workflow attempt before source
     preparation, after preparation, before compilation and before publication.
@@ -15001,6 +15006,10 @@ EOF
         # Replacement objects must not reinterpret the observed workflow SHA.
         export GIT_NO_REPLACE_OBJECTS=1
     fi
+    if $keep_draft && { $build_only || $watch_admission_set; }; then
+        log_error "--draft requires a manual release pipeline; it conflicts with --build-only and --watch-admission"
+        return 4
+    fi
     if $watch_admission_set && { ! $expected_sha_set || $build_only; }; then
         log_error "Watcher admission requires --expected-sha and a release pipeline"
         return 4
@@ -15029,6 +15038,11 @@ EOF
         if [[ "$rc" == 0 ]]; then
             event=fallback.success level=success title="Release Complete"
             message="$target released successfully"
+            if $keep_draft; then
+                title="Draft Ready"; message="$target uploaded and verified as a draft"
+            elif $build_only; then
+                title="Build Complete"; message="$target build verified"
+            fi
         else
             level=error
             case "$phase" in
@@ -15203,6 +15217,7 @@ EOF
                 --argjson skip_checks "$skip_checks" --argjson resume "$resume" \
                 --argjson parallel_jobs "$parallel_jobs" \
                 --argjson prerelease "$prerelease" --argjson prerelease_requested "$prerelease_requested" \
+                --argjson keep_draft "$keep_draft" --argjson confirmed_release "$confirmed_release" \
                 --arg resume_run_id "$resume_run_id" \
                 --argjson duration "$(($(date +%s) - start_time))" \
                 --argjson rc "$rc" --argjson now_ms "$(_fallback_now_ms)" \
@@ -15234,7 +15249,8 @@ EOF
                   build_only:$build_only,skip_checks:$skip_checks,resume:$resume,
                   parallel_jobs:$parallel_jobs,workflow_event:$workflow_event[0],
                   prerelease:$prerelease,prerelease_requested:$prerelease_requested,
-                  resume_run_id:$resume_run_id}
+                  resume_run_id:$resume_run_id,draft_requested:$keep_draft}
+                + (if $confirmed_release == null then {} else {release:$confirmed_release} end)
                 + (if $trigger == "" then {} else {trigger: $trigger} end)
                 + (if $expected_sha == "" then {} else {expected_sha: $expected_sha} end)
                 + (if $watch_admission == null then {} else
@@ -15327,6 +15343,7 @@ EOF
         $isolate_source && log_info "[dry-run] Would materialize $tag ($expected_sha) and its pinned dependencies in private source repositories"
         log_info "[dry-run] Would check, build, verify, and release $tool_name $tag in $output_dir"
         log_info "[dry-run] Target concurrency: $parallel_jobs"
+        $keep_draft && log_info "[dry-run] Would retain the verified release as a draft"
         log_info "[dry-run] Prerelease: $prerelease (explicit request: $prerelease_requested)"
         _fallback_result 0 plan
         return $?
@@ -15932,11 +15949,11 @@ EOF
             --arg sha "$(jq -r '.source.git_sha' <<< "$manifest_json")" --arg manifest "$manifest_sha" \
             --arg config "$strict_config" --arg config_sha "$strict_config_sha" \
             --arg registry "$strict_registry" --arg registry_sha "$strict_registry_sha" \
-            --argjson prerelease "$prerelease" '
+            --argjson prerelease "$prerelease" --argjson keep_draft "$keep_draft" '
             {schema_version:"dsr.strict_fallback_intent.v1",repo:$repo,tool:$tool,tag:$tag,
              build_run_id:$run,artifacts_dir:$artifacts,git_sha:$sha,manifest_sha256:$manifest,
              config:{path:$config,sha256:$config_sha},registry:{path:$registry,sha256:$registry_sha},
-             publish:true,prerelease:$prerelease}') || return 4
+             publish:($keep_draft | not),prerelease:$prerelease}') || return 4
         mkdir -p "$state_dir/releases" || return 4
         [[ -d "$state_dir/releases" && ! -L "$state_dir/releases" ]] || return 4
         for candidate in "$state_dir/releases/dsr-fallback.$strict_build_run."*; do
@@ -16030,7 +16047,7 @@ EOF
             $p.repo == $intent.repo and $p.tool == $intent.tool and $p.tag == $intent.tag and
             $p.git_sha == $intent.git_sha and $p.manifest_sha256 == $intent.manifest_sha256 and
             ($p.assets | type == "array" and length > 0 and length < 10000) and
-            $m.requested_draft == false and $m.tag_name == $intent.tag and $m.name == $intent.tag and
+            $m.requested_draft == ($intent.publish | not) and $m.tag_name == $intent.tag and $m.name == $intent.tag and
             $m.target_commitish == $intent.git_sha and ($m.prerelease | type == "boolean") and
             $m.prerelease == $intent.prerelease and
             ($m.body | type == "string" and test("<!-- dsr-create-nonce:[0-9a-f]{64} -->$")) and
@@ -16072,6 +16089,7 @@ EOF
 
     _fallback_strict_observe() {
         local observed inventory scan after asset file size sha identity cached_identity
+        local rows parse_status
         _fallback_strict_inputs_match || return $?
         scan=$(_fallback_strict_operation 7 _release_contract_scan_release_by_tag "$repo" "$tag") || return $?
         jq -e --argjson id "$strict_release_id" '.count == 1 and .release.id == $id' <<< "$scan" >/dev/null || return 7
@@ -16105,7 +16123,10 @@ EOF
         if [[ -z "$strict_bytes_dir" ]]; then
             strict_bytes_dir=$(umask 077; mktemp -d "$strict_handoff/verify.XXXXXXXX") || return 7
         fi
-        while IFS= read -r asset; do
+        rows=$(jq -c '.[]' <<< "$inventory") || {
+            parse_status=$?; ((parse_status > 128)) && return "$parse_status"; return 7;
+        }
+        while IFS= read -r asset && [[ -n "$asset" ]]; do
             file="$strict_bytes_dir/$(jq -r '.id' <<< "$asset")"
             identity=$(jq -c '{id,name,state,size,digest}' <<< "$asset") || return 7
             if [[ ! -e "$file" && ! -L "$file" && ! -e "$file.json" && ! -L "$file.json" ]]; then
@@ -16120,7 +16141,7 @@ EOF
             sha=$(_release_sha256 "$file") || return 7
             jq -e --arg sha "sha256:$sha" --argjson size "$size" \
                 '.digest == $sha and .size == $size' <<< "$asset" >/dev/null || return 7
-        done < <(jq -c '.[]' <<< "$inventory")
+        done <<< "$rows"
         after=$(_fallback_strict_operation 7 _release_contract_observe_remote_inventory "$repo" "$strict_release_id") || return $?
         _source_release_metadata_matches "$after" "$strict_metadata" "$strict_release_id" any || return 7
         jq -e --slurpfile before /dev/fd/3 '
@@ -16133,7 +16154,15 @@ EOF
 
     _fallback_strict_recover() {
         local asset name file content_type upload_rc final_result final_receipt final_proof
+        local planned_rows parse_status
         _fallback_strict_observe || return $?
+        if $keep_draft && ! jq -e '.draft == true' <<< "$strict_observed" >/dev/null; then
+            log_error "The retained fallback draft is already public"
+            return 7
+        fi
+        planned_rows=$(jq -ce '.assets[]' <<< "$strict_plan") || {
+            parse_status=$?; ((parse_status > 128)) && return "$parse_status"; return 4;
+        }
         while IFS= read -r asset; do
             name=$(jq -r '.name' <<< "$asset") || return 4
             if jq -e --arg name "$name" 'any(.assets[]; .name == $name)' <<< "$strict_observed" >/dev/null; then
@@ -16167,8 +16196,22 @@ EOF
                 log_error "Strict repair did not produce the selected asset: $name (upload exit $upload_rc)"
                 return 7
             fi
-        done < <(jq -c '.assets[]' <<< "$strict_plan")
+        done <<< "$planned_rows"
         _fallback_strict_inputs_match || return $?
+        if $keep_draft; then
+            # Observation authenticates each downloaded asset against the plan
+            # and refuses extra or duplicate entries. Require the complete set
+            # on this owned draft before returning it to the operator.
+            _fallback_strict_observe || return $?
+            jq -e --slurpfile plan /dev/fd/3 '
+                .draft == true and (.assets | length) == ($plan[0].assets | length)
+            ' 3<<< "$strict_plan" <<< "$strict_observed" >/dev/null || return 7
+            release_result=$(jq -nc --arg repo "$repo" --arg tag "$tag" --argjson id "$strict_release_id" \
+                --argjson prerelease "$prerelease" '
+                {command:"release",status:"success",exit_code:0,
+                 details:{repo:$repo,tag:$tag,release_id:$id,draft:true,prerelease:$prerelease}}') || return 4
+            return 0
+        fi
         final_result=$(TMPDIR="$strict_custody" JSON_MODE=true cmd_release_finalize "$tool_name" "$version" \
             --artifacts "$strict_artifacts" --create-response "$strict_response" --no-dispatch) || {
             local finalize_status=$?
@@ -16208,6 +16251,7 @@ EOF
     else
         fallback_release_started_ms=$(_fallback_now_ms)
         local -a release_args=("$tool_name" "$version" --artifacts "$output_dir")
+        $keep_draft && release_args+=(--draft)
         $prerelease_requested && release_args+=(--prerelease)
         case "$sbom_override" in true) release_args+=(--sbom) ;; false) release_args+=(--no-sbom) ;; esac
         [[ -z "$sbom_format" ]] || release_args+=(--sbom-format "$sbom_format")
@@ -16340,22 +16384,25 @@ EOF
         # A manual upload can successfully leave an unrelated draft private.
         # Automated fallback must not call that a completed publication or
         # retire its durable watch attempt while downloads remain unavailable.
-        if ! jq -es --arg repo "$repo" --arg tag "$tag" \
+        if ! confirmed_release=$(jq -ces --arg repo "$repo" --arg tag "$tag" --argjson draft "$keep_draft" \
             --argjson prerelease "$prerelease" --argjson requested "$prerelease_requested" \
             --argjson strict "$( [[ "$contract" != null ]] && echo true || echo false )" '
-            length == 1 and (.[0] | .command == "release" and .status == "success" and
+            select(length == 1) | .[0] | select(.command == "release" and .status == "success" and
             .exit_code == 0 and .details.repo == $repo and .details.tag == $tag and
-            .details.draft == false and
+            .details.draft == $draft and
             (.details.prerelease | type == "boolean") and
             (if $requested or $strict then .details.prerelease == $prerelease else true end) and
-            (.details.release_id | type == "number" and floor == . and . > 0))
-        ' <<< "$release_result" >/dev/null 2>&1; then
+            (.details.release_id | type == "number" and floor == . and . > 0 and . <= 9007199254740991)) |
+            .details | {repo,tag,id:.release_id,draft,prerelease}
+        ' <<< "$release_result" 2>/dev/null); then
+            confirmed_release=null
             release_status="blocked"
-            _fallback_result 7 release "Release was not confirmed public with the selected prerelease mode"
+            _fallback_result 7 release "Release visibility or prerelease mode differs from the requested result"
             return 7
         fi
         if [[ "$contract" != null ]] && ! jq -e --argjson id "$strict_release_id" \
             '.details.release_id == $id' <<< "$release_result" >/dev/null; then
+            confirmed_release=null
             release_status="blocked"
             _fallback_result 7 release "Published release differs from the original strict creation custody"
             return 7

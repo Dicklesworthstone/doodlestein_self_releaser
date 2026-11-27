@@ -1091,7 +1091,7 @@ def test_strict_publication_interruptions():
 
 
 def test_fallback_recovery(pagination_only=False, prerelease_only=False, interruption_only=False,
-                           caller_interruption_only=False):
+                           caller_interruption_only=False, draft_only=False):
     run_id='11111111-1111-4111-8111-111111111111'
     missing='payload.tar.gz.sha256'
 
@@ -1151,6 +1151,38 @@ def test_fallback_recovery(pagination_only=False, prerelease_only=False, interru
               len([row for row in rows if '--post' in row])==1 and
               json.loads((c/'remote.json').read_text())['draft'] is True)
         return c,env,output,details['publication_recovery']
+
+    if draft_only:
+        options=['--draft','--prerelease']
+        c,env,output,recovery=interrupt_upload('review-draft',options=options)
+        response=Path(recovery['create_response'])
+        original=response.read_bytes()
+        check('retained review draft freezes private visibility',
+              json.loads(Path(recovery['intent']).read_text())['publish'] is False)
+        (c/'control.json').write_text('{}')
+        result,rows=invoke_fallback(c,env,output,True,['--prerelease'],label='visibility-change')
+        check('omitting draft on strict resume stops before mutation',
+              result.returncode!=0 and not mutations(rows) and response.read_bytes()==original)
+        result,rows=invoke_fallback(c,env,output,True,options,label='review-repair')
+        check('draft recovery uploads only the missing file and never promotes',
+              result.returncode==0 and mutations(rows)==[row for row in rows if row[0]=='upload-boundary'] and
+              [row[2] for row in rows if row[0]=='upload-boundary']==[missing])
+        details=json.loads(result.stdout)['details']
+        check('review result identifies the verified private release and original finalization inputs',
+              details['release']==dict(repo='owner/app',tag='v1.2.3',id=9,draft=True,prerelease=True) and
+              details['publication_recovery']['create_response']==str(response) and
+              details['publication_recovery']['status']=='ready' and
+              json.loads((c/'remote.json').read_text())['draft'] is True)
+        result,rows=invoke_fallback(c,env,output,True,options,label='review-retry')
+        check('retry of complete draft verifies without building, uploading, or promoting',
+              result.returncode==0 and not mutations(rows) and response.read_bytes()==original and
+              (c/'build-calls').read_text().splitlines().count('build')==1)
+        remote=json.loads((c/'remote.json').read_text());remote['draft']=False
+        (c/'remote.json').write_text(json.dumps(remote))
+        result,rows=invoke_fallback(c,env,output,True,options,label='unexpected-public')
+        check('externally published release cannot satisfy a private draft retry',
+              result.returncode!=0 and not mutations(rows) and response.read_bytes()==original)
+        return
 
     if caller_interruption_only:
         selected=os.environ.get('DSR_TEST_FALLBACK_CALLER_INTERRUPTION_CASE','all')
@@ -2293,6 +2325,11 @@ if os.environ.get('DSR_TEST_STRICT_PRERELEASE_ONLY')=='1':
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
     raise SystemExit(0)
 
+if os.environ.get('DSR_TEST_STRICT_DRAFT_ONLY')=='1':
+    test_fallback_recovery(draft_only=True)
+    print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
+    raise SystemExit(0)
+
 if os.environ.get('DSR_TEST_STRICT_CLI_ONLY')=='1':
     test_public_finalizer_lifecycle()
     print(json.dumps({'checks':checks,'passed':True,'fixtures':str(work)}),flush=True)
@@ -2530,6 +2567,7 @@ for (label,controls),(c,env,response,_) in prepare_cases([('post-metadata-drift'
 test_fallback_recovery()
 test_fallback_recovery(pagination_only=True)
 test_fallback_recovery(prerelease_only=True)
+test_fallback_recovery(draft_only=True)
 test_strict_upload_interruptions()
 test_strict_creation_interruptions()
 test_strict_publication_interruptions()

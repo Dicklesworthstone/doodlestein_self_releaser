@@ -189,18 +189,20 @@ signing_verify() {
 signing_sign_files() { signing_sign_batch "$@"; }
 cmd_release() {
     printf 'RELEASE %s\n' "$*" >> "$CALLS"
-    local selected_prerelease=false argument
+    local selected_prerelease=false selected_draft=false argument
     for argument in "$@"; do
         [[ "$argument" != --prerelease ]] || selected_prerelease=true
+        [[ "$argument" != --draft ]] || selected_draft=true
     done
     if [[ "$RELEASE_RESULT_MODE" == malformed ]]; then
         printf '{invalid\n'
     else
         jq -nc --arg mode "$RELEASE_RESULT_MODE" --argjson rc "$RELEASE_RC" \
-            --argjson prerelease "$selected_prerelease" '
+            --argjson prerelease "$selected_prerelease" --argjson draft "$selected_draft" '
             {command:"release",status:(if $rc==0 then "success" else "error" end),exit_code:$rc,
-             details:{repo:"owner/tool",tag:"v1.2.3",release_id:9,draft:false,prerelease:$prerelease}} |
+             details:{repo:"owner/tool",tag:"v1.2.3",release_id:9,draft:$draft,prerelease:$prerelease}} |
             if $mode=="draft" then .details.draft=true
+            elif $mode=="public" then .details.draft=false
             elif $mode=="missing-visibility" then del(.details.draft)
             elif $mode=="wrong-tag" then .details.tag="v9.9.9"
             elif $mode=="wrong-repo" then .details.repo="owner/other"
@@ -366,7 +368,7 @@ setup() {
     QUALITY_MUTATES_SIBLING=false
     QUALITY_MUTATES_PINNED_CHILD='' BUILD_MUTATES_PINNED_CHILD=''
     BUILD_FROM_PINNED_CHILD=''
-    OTHER_SHA="" REMOTE_TAG_MODE=valid RELEASE_RESULT_MODE=public
+    OTHER_SHA="" REMOTE_TAG_MODE=valid RELEASE_RESULT_MODE=requested
     WATCH_ADMISSION_TRANSITION="" WATCH_HTTP_DRIFT="" WATCH_HTTP_RC=0
     RUN=11111111-1111-4111-8111-111111111111 SOURCE_SHA=0000000000000000000000000000000000000000
     TARGETS='linux/amd64 darwin/arm64'
@@ -467,6 +469,39 @@ test_prerelease_forwarding() {
         fi
         [[ "$mode" != completed ]] || ! grep -q '^BUILD ' "$CALLS"
     fi
+}
+test_draft_visibility() {
+    local mode="$1"
+    setup "draft-$mode"
+    case "$mode" in
+        plan)
+            run_fallback --draft --dry-run
+            [[ "$RC" == 0 && ! -s "$CALLS" && ! -e "$OUT" ]] && one_result &&
+                jq -e '.details | .draft_requested and (has("release") | not)' "$CASE/stdout" >/dev/null
+            return ;;
+        conflict|watch)
+            if [[ "$mode" == watch ]]; then
+                run_fallback --draft --watch-admission '{}'
+            else
+                run_fallback --draft --build-only
+            fi
+            [[ "$RC" == 4 && ! -s "$CALLS" && ! -e "$OUT" ]]
+            return ;;
+        public)
+            RELEASE_RESULT_MODE=public; run_fallback --draft
+            [[ "$RC" == 7 ]] && one_result &&
+                jq -e '.details | .phases.release=="blocked" and (has("release")|not)' "$CASE/stdout" >/dev/null
+            return ;;
+        resume)
+            completed_fixture; RELEASE_EXISTS=true
+            run_fallback --draft --prerelease --resume="$RUN"
+            ! grep -q '^BUILD ' "$CALLS" && grep -Eq '^RELEASE .* --resume( |$)' "$CALLS" || return 1 ;;
+        fresh) run_fallback --draft --prerelease ;;
+        *) return 1 ;;
+    esac
+    [[ "$RC" == 0 ]] && one_result && grep -Eq '^RELEASE .* --draft( |$)' "$CALLS" &&
+        jq -e '.details | .draft_requested and .phases.release=="success" and
+            .release=={id:9,repo:"owner/tool",tag:"v1.2.3",draft:true,prerelease:true}' "$CASE/stdout" >/dev/null
 }
 test_prerelease_public_confirmation() {
     setup "prerelease-confirmation-$1"
@@ -2400,6 +2435,7 @@ test_isolated_source_plan_and_arguments() {
 }
 
 run_test test_success
+for mode in fresh resume plan public conflict watch; do run_test test_draft_visibility "$mode"; done
 for mode in fresh plan resume completed; do run_test test_prerelease_forwarding "$mode"; done
 for mode in stable missing-prerelease malformed-prerelease; do run_test test_prerelease_public_confirmation "$mode"; done
 run_test test_prerelease_observed_mode_without_explicit_request

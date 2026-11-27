@@ -3211,11 +3211,21 @@ Full fallback pipeline: check -> build -> release.
 
 ```bash
 dsr fallback --repo <name> [--version <tag>]
-             [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]] [--prerelease]
+             [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]] [--draft] [--prerelease]
 ```
 
 This command coordinates quality checks, builds, verification, signing and
 publication, preserving source and artifact identity between stages.
+
+Manual `--draft` runs keep the release private after uploading and checking its
+assets. A successful release step reports `details.release` with the confirmed
+`repo`, `tag`, numeric `id`, `draft` and `prerelease`. Plans and outcomes
+include `details.draft_requested`. Combining `--draft` with `--build-only` or
+watcher admission returns 4 before work starts. Watcher success still requires
+a public release. On strict recovery the original build intent fixes both
+visibility and prerelease mode. A matching draft retry uses the original POST
+response, checks existing asset bytes, uploads missing assets, and leaves the
+owned draft available for explicit finalization. Its recovery status is `ready`.
 
 Build targets run serially by default. `--parallel` / `-p` uses
 `DSR_BUILD_PARALLELISM`, defaulting to 2 when unset or empty. `--parallel=N`
