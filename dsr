@@ -13823,6 +13823,23 @@ EOF
     release_id=$(echo "$release_json" | jq -r '.id')
     release_url=$(echo "$release_json" | jq -r '.html_url')
 
+    # A checksum repair is a second CLI invocation. The tag or configured
+    # repository can change since discovery. Check the parent's selection
+    # before preparing sidecars or sending the first mutation.
+    if $fix_missing && [[ -n ${DSR_VERIFY_RELEASE_SELECTION+x} ]] && ! jq -es \
+        --arg repo "$repo" --arg tag "$tag" --argjson selected "$DSR_VERIFY_RELEASE_SELECTION" '
+            length == 1 and (.[0] |
+                .tag_name == $tag and (.id | type == "number") and
+                [$repo, $tag, .id] == $selected)
+        ' <<< "$release_json" >/dev/null; then
+        log_error "Release identity changed before checksum repair"
+        if $JSON_MODE; then
+            json_envelope release-verify error 7 \
+                '{"error":"Release identity changed before checksum repair","repair":{"requested":true,"attempted":false}}'
+        fi
+        return 7
+    fi
+
     # Strict repair may create checksum sidecars and clobber remote assets. Do
     # not allow either mutation unless a fresh, correctly bound release record
     # proves the release is still a draft.

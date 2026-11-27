@@ -143,9 +143,11 @@ def stop(signum, frame):
 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(sig, stop)
 
-def run(command, phase):
+def run(command, phase, selected=None):
     global child
     environment = {k:v for k,v in os.environ.items() if not k.startswith('BASH_FUNC_') and k not in ('BASH_ENV','ENV')}
+    if selected is not None:
+        environment['DSR_VERIFY_RELEASE_SELECTION'] = json.dumps(selected)
     output, errors = work / (phase + '.json'), work / (phase + '.stderr')
     with output.open('xb') as out, errors.open('xb') as err:
         child = subprocess.Popen([str(x) for x in command], stdin=subprocess.DEVNULL, stdout=out,
@@ -171,7 +173,7 @@ def run(command, phase):
             child = None
     return code if code >= 0 else 5, output
 
-def metadata(phase, fix=False):
+def metadata(phase, fix=False, selected=None):
     command = ['bash', cli, '--json']
     if dry_run:
         command.append('--dry-run')
@@ -180,7 +182,7 @@ def metadata(phase, fix=False):
         command += ['--artifacts', args.artifacts]
     if fix:
         command.append('--fix')
-    code, path = run(command, phase)
+    code, path = run(command, phase, selected)
     try:
         value = read_json(path)
     except (Failure, OSError, ValueError):
@@ -190,6 +192,15 @@ def metadata(phase, fix=False):
          isinstance(value.get('details'), dict) and
          (code != 0 or value.get('status') == 'success'), 'Invalid manifest verification result')
     details = value['details']
+    # Only a completed comparison (including a report of missing assets)
+    # can authorize another phase. Preserve a terminal status even when
+    # its diagnostic envelope also contains a valid release ID.
+    if code not in (0, 1):
+        prior = result['details']
+        result['details'] = {**prior, **details}
+        if phase == 'manifest-after' and prior.get('repair') is not None:
+            result['details']['repair'] = prior['repair']
+        raise Failure(str(details.get('error', 'Manifest verification failed')), code)
     if 'release_id' not in details:
         raise Failure(str(details.get('error', 'Manifest verification did not identify a release')), code or 7)
     need(type(details['release_id']) is int and 0 < details['release_id'] <= 9007199254740991 and
@@ -373,7 +384,7 @@ try:
          str(preflight.get('error', 'Checksum audit preflight failed; no repair attempted')), preflight_code or 7)
     if args.fix:
         repair_started = True
-        base_code, details = metadata('manifest-repair', fix=True)
+        base_code, details = metadata('manifest-repair', fix=True, selected=selected)
         repair_completed = True
         result['details'] = details
         need(identity(details) == selected, 'Release identity changed during repair')
@@ -432,7 +443,7 @@ finally:
 result['details']['checksums'] = checksum_details()
 result['details']['duration_seconds'] = int(time.monotonic() - started)
 result['duration_ms'] = int((time.monotonic() - started)*1000)
-if repair_started and not repair_completed:
+if repair_started and not repair_completed and (result['details'].get('repair') or {}).get('attempted') is not False:
     result['details']['repair'] = dict(requested=True, dry_run=dry_run, attempted=True, outcome='unknown')
 if work is not None:
     result['details']['verification_evidence_dir'] = str(work)

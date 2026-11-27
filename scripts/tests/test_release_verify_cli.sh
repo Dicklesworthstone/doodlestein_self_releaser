@@ -262,6 +262,8 @@ assert args[:2] == ['app','1.2.3'], args
 if 'selected_artifacts' in spec:
     assert args[2:4] == ['--artifacts',spec['selected_artifacts']], args
 repair = '--fix' in args
+if repair:
+    assert json.loads(os.environ['DSR_VERIFY_RELEASE_SELECTION']) == ['owner/app','v1.2.3',321]
 log=base/'metadata.jsonl'
 previous = [json.loads(r) for r in log.read_text().splitlines()] if log.exists() else []
 phase = 'repair' if repair else 'after' if previous else 'before'
@@ -288,6 +290,8 @@ if phase=='after' and spec.get('metadata_mode') in ('proof-drift','payload-drift
     with file.open('ab') as f: f.write(b'changed during final metadata check')
 code = 1 if 'missing_row' in spec else 0
 mode = spec.get('metadata_mode')
+if mode == 'terminal-before' and phase == 'before': code=5
+if mode == 'terminal-after' and phase == 'after': code=5
 if mode=='strict-failure' or (phase=='after' and mode=='final-strict-failure'): code=1
 if repair and mode=='repair-failure': code=7
 names=sorted(a['name'] for a in spec['assets'])
@@ -512,10 +516,20 @@ execute('default-cannot-silently-fall-back-to-sidecars',1,mutate=sidecars)
 
 def missing(base,spec):
     spec['missing_row']=spec['assets'].pop(4)
+base,_,_,value=execute('terminal-before-repair',5,extra=('--fix',),
+    mutate=lambda b,s:(missing(b,s),s.update(metadata_mode='terminal-before')))
+check('terminal metadata with release ID stops before repair or audit',
+      [r['phase'] for r in calls(base,'metadata.jsonl')]==['before'] and
+      not calls(base,'http.jsonl') and not (base/'repair-write').exists())
 base,_,_,value=execute('repair-before-audit',extra=('--fix',),mutate=missing)
 check('repair is performed once and never replayed by final metadata check',
       [r['phase'] for r in calls(base,'metadata.jsonl')]==['before','repair','after'] and (base/'repair-write').is_file())
 check('repair evidence remains in final envelope',value['details']['repair']=={'dry_run':False,'uploads':['app-004.tar.gz']})
+base,_,_,value=execute('terminal-after-repair',5,extra=('--fix',),
+    mutate=lambda b,s:(missing(b,s),s.update(metadata_mode='terminal-after')))
+check('terminal final observation preserves the completed repair receipt',
+      [r['phase'] for r in calls(base,'metadata.jsonl')]==['before','repair','after'] and
+      value['details']['repair']=={'dry_run':False,'uploads':['app-004.tar.gz']})
 base,_,_,value=execute('dry-run-does-not-repair',1,extra=('--fix',),mutate=missing,dry=True)
 check('dry-run keeps missing asset and repair evidence without writes',not (base/'repair-write').exists() and
       value['details']['repair']['dry_run'] is True and value['details']['checksums']['status']=='error')

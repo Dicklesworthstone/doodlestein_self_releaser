@@ -2953,6 +2953,27 @@ remove_ordinary_verify_repair_mock() {
     unset ORDINARY_REPAIR_STOP_CASE ORDINARY_REPAIR_STOP_AFTER ORDINARY_REPAIR_STOP_STATUS
 }
 
+test_verify_refuses_replacement_before_checksum_repair() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for checksum repair"; return 0; fi
+    harness_setup
+    seed_repos_config
+    seed_ordinary_verify_repair source_valid || { fail "ordinary repair fixture setup"; harness_teardown; return; }
+    create_ordinary_verify_repair_mock
+    # The tag now resolves to ID 12345 after the checksum wrapper selected 12344.
+    DSR_VERIFY_RELEASE_SELECTION='["testuser/test-tool","v1.0.0",12344]' \
+        DSR_GH_TOKEN=release-fixture-token \
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+    if [[ "$(exec_status)" == 7 && ! -s "$ORDINARY_REPAIR_ROOT/uploads" ]] &&
+       exec_stdout | jq -e '.exit_code == 7 and .details.repair.attempted == false' >/dev/null; then
+        pass "replacement release receives no repair upload"
+    else
+        fail "repair must refuse the replacement release before any upload"
+    fi
+    remove_ordinary_verify_repair_mock
+    harness_teardown
+}
+
 # Execute the public CLI, including release_formulas' metadata/repair dispatch.
 # Each interruption fires once, so a broken caller exposes later API requests
 # and writes instead of merely encountering the same injected failure again.
@@ -4088,6 +4109,7 @@ test_strict_fix_refuses_release_tag_rebind_before_mutation
 test_strict_fix_final_get_rejects_postcheck_asset_flip
 test_strict_fix_dry_run_leaves_draft_and_sidecars_untouched
 test_verify_fix_attempts_upload
+test_verify_refuses_replacement_before_checksum_repair
 test_verify_fix_stops_interrupted_discovery
 test_verify_fix_stops_interrupted_context
 test_verify_fix_stops_interrupted_tag_context
