@@ -111,8 +111,11 @@ their hashes, then freezes all DSR config-file selectors and uses a private
 additional `repos.d/NAME.yaml` files may be named. Unlisted files are not copied.
 Each new or resumed native driver receives the plan's `source_sha`. The build checks
 the configured checkout against that commit before it stages sources or starts
-compilation. A mismatch returns a build error in the attempt log. The collector
-also checks the completed manifest's source independently of this preflight.
+compilation. On a mismatch the attempt log records the expected and observed
+commits. If Git cannot resolve the commit, the JSON error retains its exit status
+and reports a null observed commit. An interrupted lookup stops the build with
+exit 5. The collector also checks the completed manifest's source independently
+of this preflight.
 The copied configuration's bytes and file namespace are checked after execution.
 Native host authentication, cache defaults and toolchain environment otherwise
 follow the existing builder. No `--allow-dirty`, `--no-sync`, diagnostic mode,

@@ -3998,20 +3998,34 @@ EOF
     # lock or reserving an output directory. Keep the observed SHA for the
     # staged-source comparison; the collector independently checks the manifest.
     if [[ -n "${DSR_BUILD_PLAN_SOURCE_SHA+x}" ]]; then
+        local source_check_error="" source_check_status=4 git_status=0
         if [[ ! "$plan_source_sha" =~ ^[0-9a-f]{40}$ || "$plan_source_sha" =~ ^0{40}$ ]]; then
-            log_error "Invalid source commit in release build plan"
-            return 4
-        fi
-        build_source_sha=$(git -C "$local_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || return 4
-        if [[ "$build_source_sha" != "$plan_source_sha" ]]; then
-            log_error "Release build plan requires $plan_source_sha; checkout is at $build_source_sha"
-            if $JSON_MODE; then
-                json_envelope "build" "error" 4 "$(jq -nc --arg repo "$ACT_REPO_GITHUB" \
-                    --arg version "$tag" --arg expected "$plan_source_sha" --arg observed "$build_source_sha" \
-                    '{repo:$repo,version:$version,targets:[],error:"Checkout differs from release build plan",
-                      expected_sha:$expected,head_sha:$observed}')"
+            source_check_error="Invalid source commit in release build plan"
+            plan_source_sha=""
+        else
+            build_source_sha=$(git -C "$local_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || git_status=$?
+            if ((git_status != 0)); then
+                build_source_sha=""
+                case "$git_status" in
+                    129|130|141|143) source_check_error="Source commit lookup interrupted"; source_check_status=5 ;;
+                    *) source_check_error="Could not resolve the checkout commit for the release build plan" ;;
+                esac
+            elif [[ "$build_source_sha" != "$plan_source_sha" ]]; then
+                source_check_error="Checkout differs from release build plan"
             fi
-            return 4
+        fi
+        if [[ -n "$source_check_error" ]]; then
+            log_error "$source_check_error (expected: ${plan_source_sha:-unknown}, checkout: ${build_source_sha:-unknown})"
+            if $JSON_MODE; then
+                json_envelope "build" "error" "$source_check_status" "$(jq -nc --arg repo "$ACT_REPO_GITHUB" \
+                    --arg version "$tag" --arg error "$source_check_error" --arg expected "$plan_source_sha" \
+                    --arg observed "$build_source_sha" --argjson git_status "$git_status" '
+                    {repo:$repo,version:$version,targets:[],error:$error,
+                     expected_sha:(if $expected == "" then null else $expected end),
+                     head_sha:(if $observed == "" then null else $observed end)}
+                     + (if $git_status == 0 then {} else {git_exit_code:$git_status} end)')"
+            fi
+            return "$source_check_status"
         fi
     fi
 

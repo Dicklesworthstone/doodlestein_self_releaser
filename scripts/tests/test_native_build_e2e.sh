@@ -72,7 +72,9 @@ setup_mock_rust_tool() {
     cp -r "$FIXTURES_DIR/mock_rust_tool/." "$target_dir/"
 
     # Initialize git
-    (cd "$target_dir" && git init -q && git add . && git commit -q -m "Initial") 2>/dev/null || true
+    git -C "$target_dir" init -q && git -C "$target_dir" add . &&
+        git -C "$target_dir" -c user.name=Fixture -c user.email=fixture@example.invalid \
+            -c commit.gpgsign=false commit -q -m "Initial" || return 1
 
     echo "$target_dir"
 }
@@ -108,7 +110,9 @@ jobs:
 YAML
 
     # Initialize git
-    (cd "$target_dir" && git init -q && git add . && git commit -q -m "Initial") 2>/dev/null || true
+    git -C "$target_dir" init -q && git -C "$target_dir" add . &&
+        git -C "$target_dir" -c user.name=Fixture -c user.email=fixture@example.invalid \
+            -c commit.gpgsign=false commit -q -m "Initial" || return 1
 
     echo "$target_dir"
 }
@@ -750,7 +754,7 @@ test_release_plan_source_admission() {
     create_tool_config "mock_go_tool" "$tool_dir" "go" "mock_go_tool"
     pinned=$(git -C "$tool_dir" rev-parse HEAD) || { log_fail "Missing fixture HEAD"; cleanup_test_environment; return; }
     if ! git -C "$tool_dir" -c user.name=Fixture -c user.email=fixture@example.invalid \
-            commit -q --allow-empty -m 'Later source'; then
+            -c commit.gpgsign=false commit -q --allow-empty -m 'Later source'; then
         log_fail "Could not advance fixture checkout"
         cleanup_test_environment
         return
@@ -777,6 +781,39 @@ test_release_plan_source_admission() {
     else
         log_fail "Matching plan commit did not reach build planning (exit: $rc, output: $output)"
     fi
+
+    # Inject only the final HEAD lookup failure. All other Git operations
+    # still use the real fixture repository and the normal CLI.
+    local real_git git_rc expected_rc
+    real_git=$(command -v git)
+    mkdir -p "$TEST_TMPDIR/pin-bin"
+    cat > "$TEST_TMPDIR/pin-bin/git" <<'GIT'
+#!/usr/bin/env bash
+if [[ "${!#}" == 'HEAD^{commit}' && " $* " == *" rev-parse --verify "* ]]; then
+    exit "$DSR_TEST_GIT_STATUS"
+fi
+exec "$DSR_TEST_REAL_GIT" "$@"
+GIT
+    chmod +x "$TEST_TMPDIR/pin-bin/git"
+    for git_rc in 128 130; do
+        expected_rc=4
+        [[ "$git_rc" != 130 ]] || expected_rc=5
+        rc=0
+        output=$(DSR_BUILD_PLAN_SOURCE_SHA="$observed" PATH="$TEST_TMPDIR/pin-bin:$PATH" \
+            DSR_TEST_REAL_GIT="$real_git" DSR_TEST_GIT_STATUS="$git_rc" \
+            timeout 30 "$DSR_CMD" --json build mock_go_tool --version v0.1.0 \
+            --target linux/amd64 --output-dir "$TEST_TMPDIR/planned-output" \
+            2>"$TEST_TMPDIR/plan-lookup-error") || rc=$?
+        if [[ "$rc" == "$expected_rc" && ! -e "$TEST_TMPDIR/planned-output" ]] &&
+           jq -es --argjson code "$rc" --argjson git_rc "$git_rc" --arg expected "$observed" '
+               length == 1 and (.[0] | .exit_code == $code and
+               (.details | .expected_sha == $expected and .head_sha == null and .git_exit_code == $git_rc))
+           ' <<< "$output" >/dev/null; then
+            log_pass "Release plan retained Git lookup status $git_rc before staging"
+        else
+            log_fail "Missing source lookup evidence for Git status $git_rc (exit $rc)"
+        fi
+    done
     cleanup_test_environment
 }
 
