@@ -3679,6 +3679,22 @@ same interpretation.
 Manage Minisign identities and artifact signatures. The default subcommand is
 `check`; other subcommands are `init`, `sign`, `verify`, `fix`, and `pubkey`.
 
+`dsr --dry-run signing sign FILE` and `dsr signing sign FILE --dry-run`
+inspect the payload, any adjacent release inventory, the public key and the
+proposed sidecar. For a new signature, the preview checks the private key's
+file type and reports the payload digest and destination. It does not unlock
+the key, prompt for a password or create a signature. When a sidecar already
+exists, the preview verifies it with the public key and checks any requested
+comments. That check also works with the private key offline.
+
+`dsr signing fix --dry-run` previews mode `0600` for the selected private
+key and `0700` for the managed secrets directory, when present. The global
+`--dry-run` flag has the same effect. Permission repair requires Python 3.
+It checks both destinations before changing modes, refuses symlink leaves
+and multiply linked keys, and reports a failure if it cannot verify the
+requested mode on the selected object. A custom key outside the managed
+directory can be repaired when that directory is absent.
+
 **Initialization:**
 
 ```bash

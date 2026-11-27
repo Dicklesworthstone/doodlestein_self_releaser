@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_signing.sh - Unit tests for src/signing.sh
 #
-# Run: ./scripts/tests/test_signing.sh [--encrypted-only|--init-only]
+# Run: ./scripts/tests/test_signing.sh [--encrypted-only|--init-only|--fix-only]
 #
 # Real-behavior tests using actual minisign. Skips if minisign is missing.
 # (No-mocks compliant per bd-3py)
@@ -14,7 +14,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ============================================================================
 # Dependency Check (no-mocks compliance: skip if missing, don't fake)
 # ============================================================================
-if ! command -v minisign &>/dev/null; then
+if [[ "${1:-}" != --fix-only ]] && ! command -v minisign &>/dev/null; then
     echo "SKIP: minisign is required for signing tests"
     echo "  Install: brew install minisign OR apt install minisign"
     exit 0
@@ -130,9 +130,43 @@ test_signing_check_valid() {
 }
 
 test_signing_fix_permissions() {
+  local base="$TEMP_DIR/fix" rc=0
+  local -x SIGNING_SECRETS_DIR="$base/secrets" SIGNING_PRIVATE_KEY="$base/secrets/minisign.key"
+  local -x DSR_STATE_DIR="$base/state" DSR_CONFIG_DIR="$base" DSR_MINISIGN_KEY="$SIGNING_PRIVATE_KEY"
+  mkdir -p "$SIGNING_SECRETS_DIR" "$base/other"
+  printf 'fixture key bytes\n' > "$SIGNING_PRIVATE_KEY"
+  chmod 755 "$SIGNING_SECRETS_DIR"
   chmod 644 "$SIGNING_PRIVATE_KEY"
-  run_cmd "signing_fix_permissions sets 600" signing_fix_permissions >/dev/null
-  run_cmd "private key perms fixed" assert_mode "$SIGNING_PRIVATE_KEY" "600"
+  run_cmd "global CLI preview succeeds" "$PROJECT_ROOT/dsr" --dry-run signing fix
+  run_cmd "global preview preserves key mode" assert_mode "$SIGNING_PRIVATE_KEY" 644
+  run_cmd "local CLI preview succeeds" "$PROJECT_ROOT/dsr" signing fix -n
+  run_cmd "local preview preserves directory mode" assert_mode "$SIGNING_SECRETS_DIR" 755
+  run_cmd "local preview preserves key mode" assert_mode "$SIGNING_PRIVATE_KEY" 644
+  "$PROJECT_ROOT/dsr" signing fix --unknown > "$base/unknown.out" 2> "$base/unknown.err" || rc=$?
+  run_cmd "unknown fix argument returns usage error" test "$rc" = 4
+  run_cmd "argument error preserves key mode" assert_mode "$SIGNING_PRIVATE_KEY" 644
+  ln "$SIGNING_PRIVATE_KEY" "$base/other-link"
+  run_expect_fail "refuse a multiply linked private key" signing_fix_permissions
+  run_cmd "linked key retains its original mode" assert_mode "$base/other-link" 644
+  run_cmd "rejected repair preserves directory mode" assert_mode "$SIGNING_SECRETS_DIR" 755
+  local leaf="$base/other/key"
+  printf 'standalone key\n' > "$base/standalone"
+  chmod 644 "$base/standalone"
+  ln -s "$base/standalone" "$leaf"
+  SIGNING_PRIVATE_KEY="$leaf" run_expect_fail "refuse a symlink key leaf" signing_fix_permissions
+  run_cmd "refused key link preserves its target" assert_mode "$base/standalone" 644
+  ln -s "$base/other" "$base/directory-link"
+  SIGNING_PRIVATE_KEY="$base/standalone" SIGNING_SECRETS_DIR="$base/directory-link/" \
+    run_expect_fail "refuse symlink secrets directory before changing standalone key" signing_fix_permissions
+  run_cmd "refused directory link preserves standalone key" assert_mode "$base/standalone" 644
+  SIGNING_PRIVATE_KEY="$base/standalone"
+  chmod 000 "$SIGNING_PRIVATE_KEY"
+  run_cmd "repair an unreadable owned private key" signing_fix_permissions
+  run_cmd "private key repaired to 600" assert_mode "$SIGNING_PRIVATE_KEY" 600
+  run_cmd "secrets directory repaired to 700" assert_mode "$SIGNING_SECRETS_DIR" 700
+  SIGNING_SECRETS_DIR="$base/absent"
+  run_cmd "configured standalone key permits an absent default directory" signing_fix_permissions
+  run_cmd "repair leaves the absent directory absent" test ! -e "$SIGNING_SECRETS_DIR"
 }
 
 key_digest() {
@@ -1053,6 +1087,8 @@ echo ""
 
 if [[ "${1:-}" == "--encrypted-only" ]]; then
   test_signing_encrypted_key_input
+elif [[ "${1:-}" == "--fix-only" ]]; then
+  test_signing_fix_permissions
 elif [[ "${1:-}" == "--init-only" ]]; then
   test_signing_init_preserves_identities
 else

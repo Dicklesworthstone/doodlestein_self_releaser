@@ -97,6 +97,16 @@ new_file() {
 }
 no_staging() { [[ -z "$(find "$TEMP/artifacts" \( -name '*.dsr-signing.*' -o -name '*.dsr-batch.*' \) -print)" ]]; }
 new_file release.tar.gz
+run signing_sign --dry-run "$artifact"
+check 'command-local signing preview succeeds' equal "$status" 0
+DRY_RUN=true run signing_sign "$artifact"
+check 'global signing preview succeeds' equal "$status" 0
+check 'preview identifies the selected digest' grep -Fq "$(_signing_sha256 "$artifact")" "$TEMP/last.err"
+check 'neither preview invokes Minisign' test ! -s "$CALLS"
+check 'neither preview creates a sidecar' test ! -e "$artifact.minisig"
+check 'neither preview leaves staging files' no_staging
+SIGNING_PRIVATE_KEY="$TEMP/missing" run signing_sign -n "$artifact"
+check 'fresh signing preview checks the selected key exists' equal "$status" 3
 run signing_sign "$artifact"
 check 'ordinary signing publishes a sidecar only after verification' equal "$status" 0
 check 'signer output stays off stdout' equal "$output" ''
@@ -104,6 +114,12 @@ check 'sidecar verifies against the configured key' signing_verify "$artifact"
 check 'staging files are removed on success' no_staging
 saved=$(_signing_sha256 "$artifact.minisig")
 before=$(grep -c '^-S ' "$CALLS")
+SIGNING_PRIVATE_KEY="$TEMP/missing" run signing_sign "$artifact" --dry-run
+check 'reuse preview verifies with the private key offline' equal "$status" 0
+run signing_sign --dry-run "$artifact" -t 'contradictory comment'
+check 'reuse preview refuses a conflicting sidecar' equal "$status" 4
+check 'preview retains existing signature bytes' equal "$saved" "$(_signing_sha256 "$artifact.minisig")"
+check 'reuse previews never sign' equal "$before" "$(grep -c '^-S ' "$CALLS")"
 run signing_sign "$artifact"
 check 'retry of already signed artifact succeeds' equal "$status" 0
 check 'retry preserves exact signature bytes' equal "$saved" "$(_signing_sha256 "$artifact.minisig")"

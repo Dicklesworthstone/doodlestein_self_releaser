@@ -459,24 +459,87 @@ EOF
 }
 
 # Fix permissions on private key
-# Usage: signing_fix_permissions
+# Usage: signing_fix_permissions [--dry-run]
 signing_fix_permissions() {
-    if [[ ! -f "$SIGNING_PRIVATE_KEY" ]]; then
-        _sign_log_error "Private key not found: $SIGNING_PRIVATE_KEY"
-        return 1
-    fi
+    local dry_run="${DRY_RUN:-false}" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n) dry_run=true ;;
+            --help|-h) printf 'Usage: dsr signing fix [--dry-run|-n]\n' >&2; return 0 ;;
+            *) _sign_log_error "Unknown signing fix argument: $arg"; return 4 ;;
+        esac
+    done
+    command -v python3 >/dev/null 2>&1 || { _sign_log_error "python3 is required for safe permission repair"; return 3; }
+    python3 -I - "$SIGNING_PRIVATE_KEY" "$SIGNING_SECRETS_DIR" "$dry_run" <<'PY'
+import os
+import stat
+import sys
 
-    _sign_log_info "Setting permissions on $SIGNING_PRIVATE_KEY"
-    chmod 600 "$SIGNING_PRIVATE_KEY"
-    _sign_log_ok "Permissions set to 600"
+key, directory, dry_run = sys.argv[1:]
+targets = []
+try:
+    # Inspect both destinations before touching either. A configured key can
+    # live outside the default secrets directory, which need not exist.
+    for path, mode in ((directory, 0o700), (key, 0o600)):
+        path = path.rstrip(os.sep)
+        if os.path.basename(path) in ("", ".", ".."):
+            raise ValueError("permission repair requires a named key or secrets directory: " + path)
+        try:
+            before = os.lstat(path)
+        except FileNotFoundError:
+            if mode == 0o700:
+                continue
+            raise
+        is_key = mode == 0o600
+        if not (stat.S_ISREG(before.st_mode) and before.st_nlink == 1 if is_key
+                else stat.S_ISDIR(before.st_mode)):
+            raise ValueError("expected a single-link regular private key or a non-symlink secrets directory: " + path)
+        flags = os.O_NOFOLLOW | os.O_NONBLOCK
+        proc_fd = False
+        try:
+            fd = os.open(path, flags | os.O_RDONLY)
+        except PermissionError:
+            # An owner may repair a file whose current mode denies reading.
+            # Linux O_PATH pins the inode but chmod needs its proc descriptor
+            # path. Darwin offers metadata-only O_EVTONLY descriptors.
+            if hasattr(os, "O_PATH"):
+                fd = os.open(path, flags | os.O_PATH)
+                proc_fd = True
+            elif hasattr(os, "O_EVTONLY"):
+                fd = os.open(path, flags | os.O_EVTONLY)
+            else:
+                raise
+        targets.append((path, mode, fd, proc_fd))
+        if not os.path.samestat(before, os.fstat(fd)):
+            raise ValueError("destination changed while opening: " + path)
 
-    # Also fix secrets directory
-    if [[ -d "$SIGNING_SECRETS_DIR" ]]; then
-        chmod 700 "$SIGNING_SECRETS_DIR"
-        _sign_log_ok "Secrets directory permissions set to 700"
-    fi
-
-    return 0
+    for path, mode, fd, proc_fd in targets:
+        info = os.fstat(fd)
+        if not os.path.samestat(info, os.lstat(path)) or (mode == 0o600 and info.st_nlink != 1):
+            raise ValueError("destination changed during permission repair: " + path)
+        if dry_run == "true":
+            print(f"[signing] [dry-run] Would set {path} to {mode:o}", file=sys.stderr)
+            continue
+        if stat.S_IMODE(info.st_mode) != mode:
+            if proc_fd:
+                os.chmod(f"/proc/self/fd/{fd}", mode)
+            else:
+                os.fchmod(fd, mode)
+        info = os.fstat(fd)
+        if (stat.S_IMODE(info.st_mode) != mode or not os.path.samestat(info, os.lstat(path))
+                or (mode == 0o600 and info.st_nlink != 1)):
+            raise ValueError("permission repair could not be verified: " + path)
+        print(f"[signing] Verified {path} mode {mode:o}", file=sys.stderr)
+except ValueError as error:
+    print("[signing] " + str(error), file=sys.stderr)
+    sys.exit(4)
+except OSError as error:
+    print("[signing] Permission repair failed: " + str(error), file=sys.stderr)
+    sys.exit(1)
+finally:
+    for _, _, fd, _ in targets:
+        os.close(fd)
+PY
 }
 
 # Sign a file with minisign
@@ -486,9 +549,14 @@ signing_sign() {
     local file=""
     local trusted_comment=""
     local untrusted_comment=""
+    local dry_run="${DRY_RUN:-false}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --dry-run|-n)
+                dry_run=true
+                shift
+                ;;
             --trusted-comment|-t)
                 [[ $# -ge 2 && -n "$2" ]] || return 4
                 trusted_comment="$2"
@@ -506,6 +574,7 @@ Usage: signing_sign <file> [options]
 Sign a file with minisign. Creates <file>.minisig alongside the original.
 
 Options:
+  -n, --dry-run            Check the artifact and plan signing without creating a signature
   -t, --trusted-comment    Trusted comment (verified with signature)
   -c, --untrusted-comment  Untrusted comment (not verified)
 
@@ -557,6 +626,13 @@ EOF
         return 0
     fi
     [[ -n "$trusted_comment" ]] || trusted_comment="dsr artifact ${file##*/} sha256:$digest"
+    if [[ "$dry_run" == true ]]; then
+        signing_sign_exact "$file" "$signature" "$SIGNING_PRIVATE_KEY" "$token" \
+            "$trusted_comment" "$digest" "$untrusted_comment" --dry-run || return $?
+        _signing_release_snapshot_matches "$inventory_snapshot" "$file" || return $?
+        _sign_log_info "[dry-run] Would sign $file (sha256:$digest) and create $signature"
+        return 0
+    fi
     _sign_log_info "Signing and verifying: $file"
     signing_sign_exact "$file" "$signature" "$SIGNING_PRIVATE_KEY" "$token" \
         "$trusted_comment" "$digest" "$untrusted_comment" || return $?
@@ -1032,7 +1108,7 @@ PY
 # Once published, a late failure never unlinks the shared destination pathname;
 # Bash cannot atomically prove inode ownership and unlink it without a race.
 signing_sign_exact() (
-    [[ $# -ge 5 && $# -le 7 ]] || return 4
+    [[ $# -ge 5 && ( $# -le 7 || ( $# -eq 8 && "$8" == --dry-run ) ) ]] || return 4
     local file="$1"
     local signature="$2"
     local private_key="$3"
@@ -1080,6 +1156,10 @@ signing_sign_exact() (
     signature_name="${signature##*/}"
     [[ -n "$signature_name" && "$signature_name" != . && "$signature_name" != .. &&
        "$signature_name" != *[[:cntrl:]]* && -d "$signature_parent" && ! -L "$signature_parent" ]] || return 4
+    # Keep the release publisher's primitive explicit: only this argument can
+    # turn its successful preflight into a preview. Never inherit a CLI flag
+    # here, where callers depend on success meaning a sidecar was published.
+    [[ "${8:-}" != --dry-run ]] || return 0
     umask 077
     staging_dir=$(mktemp -d \
         "$signature_parent/.${signature_name}.dsr-signing.XXXXXX") || {

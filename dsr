@@ -20138,7 +20138,7 @@ cmd_signing() {
             signing_verify "$@"
             ;;
         fix)
-            signing_fix_permissions
+            signing_fix_permissions "$@"
             ;;
         pubkey|public-key)
             signing_get_public_key "$@"
@@ -20155,13 +20155,14 @@ SUBCOMMANDS:
     check       Verify keypair is configured
     sign        Sign a file
     verify      Verify a file signature
-    fix         Fix private key permissions
+    fix         Set the private key to 600 and its configured secrets directory to 700
     pubkey      Display public key
 
 EXAMPLES:
     dsr signing init              Generate new keypair
     dsr signing init --force      Replace the keypair (old pair kept in unique *.bak.* files)
     dsr signing init --dry-run    Show what init would create or replace
+    dsr signing fix --dry-run     Preview private key and directory permission changes
     dsr signing check             Check if keys are configured
     dsr signing sign artifact.tar.gz
     dsr signing verify artifact.tar.gz
