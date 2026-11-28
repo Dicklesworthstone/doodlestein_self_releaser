@@ -1512,13 +1512,24 @@ for libc in $libcs; do
     [[ "$libc" != musl ]] || printf 'different license\n' > "$artifact_dir/payload-$libc/LICENSE"
     members+=(LICENSE)
   fi
-  tar -C "$artifact_dir/payload-$libc" -czf \
-    "$artifact_dir/lane-tool-1.2.3-x86_64-unknown-linux-$libc.tar.gz" "${members[@]}" || exit 1
+  archive="$artifact_dir/lane-tool-${LANE_ARCHIVE_PREFIX:-1.2.3}-x86_64-unknown-linux-$libc.tar.gz"
+  if [[ -n "${LANE_RAW_PAYLOADS:-}" ]]; then
+    archive="${archive%.tar.gz}"
+    cp -p "$artifact_dir/payload-$libc/lane-tool" "$archive" || exit 1
+  else
+    tar -C "$artifact_dir/payload-$libc" -czf "$archive" "${members[@]}" || exit 1
+  fi
+  if [[ -n "${LANE_ARCHIVE_PROOFS:-}" ]]; then
+    cp -p "$archive" "$LANE_ARCHIVE_PROOFS/$libc" || exit 1
+  fi
   if [[ "$libc" == musl && -n "${LANE_ORIGINAL_ARCHIVE:-}" ]]; then
     cp -p "$artifact_dir/lane-tool-1.2.3-x86_64-unknown-linux-$libc.tar.gz" "$LANE_ORIGINAL_ARCHIVE" || exit 1
   fi
   rm -r "$artifact_dir/payload-$libc"
 done
+# Simulate another writer claiming the configured release name during the
+# build, after the empty output directory has passed initial admission.
+if [[ -n "${LANE_BLOCKED_NAME:-}" ]]; then printf 'other producer\n' > "$LANE_BLOCKED_NAME"; fi
 exit 0
 EOF
 )"
@@ -1561,6 +1572,86 @@ test_build_packages_each_target_triple_variant() {
     fi
 
     harness_teardown
+}
+
+# Workflow transport names may identify the compiler variant without using the
+# release's naming template. Every public versioned filename must exist before
+# the build is sealed, alongside its installer names.
+test_build_names_workflow_archives() {
+    local policy
+    for policy in qualified shared includes binary conflict; do
+        ((TESTS_RUN++))
+        if [[ "$HAS_YQ" != true ]]; then skip "yq required for workflow naming"; continue; fi
+        harness_setup
+        local repo_dir="$TEST_TMPDIR/variant-repo" out="$TEST_TMPDIR/variant-out"
+        local proofs="$TEST_TMPDIR/proofs" gnu=x86_64-unknown-linux-gnu musl=x86_64-unknown-linux-musl blocked=""
+        local libc triple versioned alias digest manifest producer raw="" suffix=.tar.gz problems=()
+        manifest="$out/lane-tool-v1.2.3-manifest.json"
+        seed_variant_lane_fixture "$repo_dir"
+        mkdir -p "$proofs" "$out"
+        if [[ "$policy" != includes ]]; then
+            yq -i '.include_files=[]' "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+        fi
+        if [[ "$policy" == shared ]]; then
+            yq -i '.artifact_naming="${name}-${version}-${os}-${arch}" |
+                .install_script_compat="${name}-${os}-${arch}"' "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+        elif [[ "$policy" == conflict ]]; then
+            blocked="$out/lane-tool-1.2.3-$gnu.tar.gz"
+        elif [[ "$policy" == binary ]]; then
+            yq -i '.archive_format.linux="binary"' "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+            raw=true
+            suffix=""
+        fi
+        LANE_RAW_PAYLOADS="$raw" LANE_BLOCKED_NAME="$blocked" LANE_ARCHIVE_PROOFS="$proofs" LANE_ARCHIVE_PREFIX=workflow exec_run run_lane_build \
+            lane-tool --version 1.2.3 --output-dir "$out"
+        if [[ "$policy" == conflict ]]; then
+            [[ "$(exec_status)" != 0 ]] || problems+=("conflicting existing release name was accepted")
+            [[ "$(cat "$blocked")" == "other producer" ]] ||
+                problems+=("conflicting bytes were replaced")
+            lane_publication_matches "$out" "$manifest" false || problems+=("conflict remained publishable")
+        else
+            [[ "$(exec_status)" == 0 ]] || problems+=("build failed: $(exec_status)")
+            for libc in gnu musl; do
+                triple="x86_64-unknown-linux-$libc"
+                versioned="lane-tool-1.2.3-$triple$suffix"
+                alias="lane-tool-$triple$suffix"
+                producer="lane-tool-workflow-$triple$suffix"
+                if [[ "$policy" == shared ]]; then
+                    versioned=lane-tool-1.2.3-linux-amd64.tar.gz
+                    alias=lane-tool-linux-amd64.tar.gz
+                    if [[ "$libc" == musl ]]; then
+                        versioned="lane-tool-1.2.3-linux-amd64-$musl.tar.gz"
+                        alias=""
+                    fi
+                fi
+                cmp -s "$proofs/$libc" "$out/$producer" || problems+=("changed producer $producer")
+                if [[ "$policy" == includes ]]; then
+                    tar -xOzf "$out/$versioned" LICENSE 2>/dev/null | cmp -s - "$repo_dir/LICENSE" ||
+                        problems+=("$versioned lacks the configured LICENSE")
+                    [[ "$(tar -xOzf "$out/$versioned" lane-tool 2>/dev/null | tail -1)" == "echo $libc" ]] ||
+                        problems+=("$versioned contains the wrong payload")
+                else
+                    cmp -s "$proofs/$libc" "$out/$versioned" || problems+=("wrong or absent $versioned")
+                fi
+                if [[ "$policy" == binary ]]; then
+                    [[ -x "$out/$versioned" && "$("$out/$versioned" 2>/dev/null)" == "$libc" ]] ||
+                        problems+=("$versioned does not execute its own ABI fixture")
+                fi
+                [[ -z "$alias" ]] || cmp -s "$out/$versioned" "$out/$alias" || problems+=("wrong or absent $alias")
+                digest=$(sha256sum "$out/$versioned" 2>/dev/null | cut -d' ' -f1)
+                jq -e --arg name "$versioned" --arg triple "$triple" --arg sha "$digest" \
+                    '[.artifacts[]|select(.name==$name and .target_triple==$triple and .sha256==$sha)]|length==1' \
+                    "$manifest" >/dev/null 2>&1 || problems+=("manifest lacks verified $versioned")
+            done
+        fi
+        if [[ ${#problems[@]} == 0 ]]; then
+            pass "workflow archives satisfy the public release names ($policy)"
+        else
+            fail "workflow archive release names ($policy): ${problems[*]}"
+            echo "stderr: $(exec_stderr | tail -10)"
+        fi
+        harness_teardown
+    done
 }
 
 test_build_refuses_unproduced_target_triple_variant() {
@@ -2274,6 +2365,12 @@ PY
     harness_teardown
 }
 
+if [[ "${1:-}" == --prebuilt-naming-only ]]; then
+    test_build_names_workflow_archives
+    printf '\nWorkflow naming: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
+    [[ "$TESTS_FAILED" == 0 && "$TESTS_SKIPPED" == 0 ]]
+    exit $?
+fi
 if [[ "${1:-}" == --variant-inventory-only ]]; then
     test_build_packages_each_target_triple_variant
     test_build_refuses_unproduced_target_triple_variant
@@ -2358,6 +2455,7 @@ echo "Lane Archives and include_files:"
 test_build_completes_lane_archive_with_include_files
 test_build_refuses_attested_thin_lane_archive
 test_build_checks_prebuilt_include_contract
+test_build_names_workflow_archives
 test_build_validates_prebuilt_archives_without_includes
 test_build_workflow_zip_admission
 test_build_packages_each_target_triple_variant

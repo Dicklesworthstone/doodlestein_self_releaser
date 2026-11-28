@@ -5313,7 +5313,6 @@ EOF
     }
 
     local -a extra_manifest_entries=()
-    local -A existing_archive_formats=()
 
     _build_sha256() {
         local file="$1"
@@ -5406,6 +5405,10 @@ EOF
         fi
 
         local compat_path="$output_dir/$compat_name"
+        if ! _act_is_safe_basename "$compat_name" || [[ -L "$compat_path" || ( -e "$compat_path" && ! -f "$compat_path" ) ]]; then
+            log_error "Invalid archive alias destination: $compat_name"
+            return 1
+        fi
         if [[ -f "$compat_path" ]]; then
             if cmp -s "$compat_path" "$src_path" 2>/dev/null; then
                 log_info "Compat alias already present: $compat_name"
@@ -5416,10 +5419,11 @@ EOF
             return 1
         fi
 
-        if cp "$src_path" "$compat_path"; then
+        if _act_collect_stream_exclusive "$compat_path" 644 _act_stream_local_file "$src_path" >/dev/null &&
+            cmp -s "$src_path" "$compat_path"; then
             log_info "Created compat alias: $compat_name"
             _build_manifest_add_entry "$compat_path" "$target" "$format" "$target_triple"
-            return 0
+            return $?
         fi
 
         log_warn "Failed to create compat alias: $compat_name"
@@ -5840,7 +5844,7 @@ EOF
     _build_emit_variant_aliases() {
         local tool="$1" version="$2" target="$3" format="$4" naming_ext="$5"
         local output_dir="$6" repo_path="$7" primary_versioned="$8"
-        local native_results="${9:-null}" primary_compat="${10:-}"
+        local primary_compat="${9:-}"
         local listed triple names_json versioned compat variant_path
         local -a triples=()
         listed=$(config_get_target_triples "$tool" "$target" 2>/dev/null) || return 0
@@ -5855,34 +5859,15 @@ EOF
                 "${target%/*}" "${target#*/}" "$naming_ext" "$repo_path" "$triple" 2>/dev/null) || names_json=""
             versioned=$(jq -r '.versioned // empty' <<< "$names_json" 2>/dev/null) || versioned=""
             compat=$(jq -r '.compat // empty' <<< "$names_json" 2>/dev/null) || compat=""
-            local native_variant=false naming_override=""
-            if jq -e --arg platform "$target" --arg triple "$triple" '
-                any(.targets[]?; .platform == $platform and .method == "native" and
-                    .target_triple == $triple and
-                    (.status == "success" or .status == "ok" or .status == "passed"))
-            ' <<< "$native_results" >/dev/null 2>&1; then
-                native_variant=true
-            fi
+            local naming_override
             if [[ -z "$versioned" ]]; then
-                log_warn "Unable to name variant $triple of $tool $target"
-                continue
+                log_error "Unable to name variant $triple of $tool $target"
+                return 1
             fi
             if [[ "$versioned" == "$primary_versioned" ]]; then
-                if $native_variant; then
-                    # Native compilation has produced distinct payloads even
-                    # when an older naming pattern only names the platform.
-                    # Retain its primary name and package every other variant
-                    # under the same qualification used by native collection.
-                    versioned=$(_act_native_variant_artifact_name \
-                        "$tool" "$target" "$triple" "$versioned") || {
-                        collect_failed=true
-                        return 1
-                    }
-                    log_info "Native variant $triple uses its qualified archive name: $versioned"
-                else
-                    log_warn "artifact_naming for $tool does not distinguish the variants of $target (add \${target_triple}); only ${triples[0]} gets installer names"
-                    return 0
-                fi
+                # A platform-only template belongs to the first ABI. Qualify
+                # every other release name the same way for all build lanes.
+                versioned=$(_act_native_variant_artifact_name "$tool" "$target" "$triple" "$versioned") || return 1
             fi
             # A shared public name belongs to the primary for every lane.
             # A workflow's secondary alias must not steal that name before
@@ -5903,53 +5888,11 @@ EOF
                 return 1
             fi
             log_info "Variant $triple of $tool $target: $versioned"
-            local variant_format include
-            local -a missing=()
-            variant_format=$(packaging_format_for_name "${variant_path##*/}")
-            local requested_format="$format"
-            [[ "$requested_format" == tgz ]] && requested_format=tar.gz
-            if [[ "$requested_format" == binary && "$variant_format" != none ]]; then
-                log_error "Variant $triple is an archive; refusing to publish archive bytes as a raw executable"
-                collect_failed=true
+            _build_package_archive_for_target "$tool" "$version" "$target" \
+                "$output_dir" "$repo_path" "$binary_name" "$variant_path" "$triple" "$naming_override" || return 1
+            if [[ ! -f "$output_dir/$versioned" ]]; then
+                log_error "Missing packaged variant $triple: $versioned"
                 return 1
-            fi
-            if [[ "$requested_format" != binary && "$variant_format" != "$requested_format" ]]; then
-                # A platform job can emit a different container for each
-                # libc variant. Convert the actual payload before assigning
-                # a new extension; copying xz bytes to a .tar.gz alias makes
-                # the release impossible to install.
-                _build_package_archive_for_target "$tool" "$version" "$target" \
-                    "$output_dir" "$repo_path" "$binary_name" "$variant_path" "$triple" "$naming_override" || return 1
-                if [[ ! -f "$output_dir/$versioned" ]]; then
-                    log_error "Could not package $triple as $requested_format: $versioned"
-                    collect_failed=true
-                    return 1
-                fi
-                continue
-            fi
-            if [[ "$format" != "binary" && "$variant_format" != none ]]; then
-                local missing_text
-                if ! missing_text=$(_build_archive_missing_includes "$tool" "$variant_path" \
-                        "$variant_format" "$repo_path"); then
-                    collect_failed=true
-                    return 1
-                fi
-                while IFS= read -r include; do
-                    [[ -n "$include" ]] && missing+=("$include")
-                done <<< "$missing_text"
-                if [[ ${#missing[@]} -gt 0 ]] && ! _build_complete_lane_archive "$tool" "$target" \
-                        "$format" "$variant_path" "$variant_format" "$compat" \
-                        "$output_dir" "$repo_path" "$triple" "${missing[@]}"; then
-                    continue
-                fi
-            fi
-            [[ -n "$compat" && "$compat" != "$versioned" ]] || continue
-            if [[ "$format" == "binary" ]]; then
-                _build_emit_binary_alias "$variant_path" "$compat" "$output_dir" "$target" "$triple" || collect_failed=true
-            elif _build_is_archive_ext "$compat"; then
-                _build_emit_compat_alias "$variant_path" "$compat" "$output_dir" "$target" "$format" "$triple" || collect_failed=true
-            else
-                log_warn "Variant $triple of $tool $target: installer name $compat is not an archive; no alias emitted"
             fi
         done
     }
@@ -6043,31 +5986,6 @@ EOF
             return 1
         fi
 
-        local existing_format="${existing_archive_formats[$target]:-}"
-        if [[ -n "$binary_override" && -f "$binary_override" ]]; then
-            # Only the selected primary determines prebuilt reuse. A platform
-            # may also carry companion archives or another compiler variant.
-            existing_format=$(packaging_format_for_name "${binary_override##*/}")
-            [[ "$existing_format" != none ]] || existing_format=""
-        fi
-        if [[ -n "$existing_format" && "$existing_format" == "$format" ]]; then
-            if [[ ${#include_files[@]} -gt 0 && -n "$repo_path" && "$format" != "binary" ]]; then
-                # Fall through: the lane's archive may lack the configured
-                # include_files, which is verified against its member list
-                # below (GH#16) rather than assumed.
-                :
-            else
-                if [[ "$format" != "binary" ]] && \
-                   ! packaging_validate_archive "$binary_override" "$format"; then
-                    log_error "Invalid prebuilt archive for $tool $target: $binary_override"
-                    collect_failed=true
-                    return 1
-                fi
-                log_info "Archive already produced for $tool $target ($format); skipping packaging"
-                return 0
-            fi
-        fi
-
         local naming_ext="$format"
         if [[ "$format" == "binary" ]]; then
             naming_ext=""
@@ -6140,21 +6058,24 @@ EOF
                 [[ -n "$include" ]] && missing_includes+=("$include")
             done <<< "$missing_text"
 
-            if [[ "$input_format" == "$normalized_format" ]]; then
+            if [[ "$input_format" == "$normalized_format" &&
+                  ( ${#missing_includes[@]} -eq 0 || "$binary_path" -ef "$archive_path" ) ]]; then
                 if [[ ${#missing_includes[@]} -eq 0 ]]; then
                     log_info "Archive already produced for $tool $target ($format); skipping packaging"
-                    return 0
-                fi
-                if [[ "$binary_path" -ef "$archive_path" ]]; then
+                    _build_emit_compat_alias "$binary_path" "$versioned_name" "$output_dir" "$target" "$format" "$target_triple" || return 1
+                else
                     # The lane's archive already occupies the release name
                     # but lacks configured include_files (GH#29). Complete
                     # it in place, or fail the build visibly when lane
                     # checksums or signatures attest the thin bytes.
                     _build_complete_lane_archive "$tool" "$target" "$format" \
                         "$archive_path" "$normalized_format" "$compat_name" \
-                        "$output_dir" "$repo_path" "$target_triple" "${missing_includes[@]}"
-                    return $?
+                        "$output_dir" "$repo_path" "$target_triple" "${missing_includes[@]}" || return 1
                 fi
+                if [[ "$compat_name" != "$versioned_name" ]] && _build_is_archive_ext "$compat_name"; then
+                    _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || return 1
+                fi
+                return 0
             fi
             if [[ -f "$archive_path" ]]; then
                 log_warn "Overwriting existing archive: $archive_path"
@@ -6256,25 +6177,6 @@ EOF
             return 0
         fi
 
-        if [[ -n "$manifest_file" && -f "$manifest_file" ]]; then
-            local target format primary_artifacts
-            primary_artifacts=$(_build_primary_manifest_artifacts "$manifest_file") || return 4
-            while IFS=$'\t' read -r target format; do
-                [[ -z "$target" || -z "$format" || "$format" == "none" ]] && continue
-                existing_archive_formats["$target"]="$format"
-            done < <(jq -r '.[] | [.target // "", .archive_format // ""] | @tsv' <<< "$primary_artifacts" 2>/dev/null)
-        else
-            local target artifact_path
-            while IFS=$'\t' read -r target artifact_path; do
-                [[ -z "$target" || -z "$artifact_path" ]] && continue
-                case "$artifact_path" in
-                    *.tar.gz|*.tgz) existing_archive_formats["$target"]="tar.gz" ;;
-                    *.tar.xz) existing_archive_formats["$target"]="tar.xz" ;;
-                    *.zip) existing_archive_formats["$target"]="zip" ;;
-                esac
-            done < <(echo "$result_json" | jq -r '.targets[]? | [.platform, (.artifact_path // .artifact // "")] | @tsv' 2>/dev/null)
-        fi
-
         for target in "${targets[@]}"; do
             log_info "Packaging installer archive for $tool $target"
             local os arch format names_json versioned_name compat_name primary_triple
@@ -6325,7 +6227,7 @@ EOF
 
             if [[ "$format" != "none" ]]; then
                 _build_emit_variant_aliases "$tool" "$version" "$target" "$format" "$naming_ext" \
-                    "$output_dir" "$repo_path" "$versioned_name" "$result_json" "$compat_name" || return 1
+                    "$output_dir" "$repo_path" "$versioned_name" "$compat_name" || return 1
             fi
 
             # The primary's actual container determines whether it needs
@@ -6345,39 +6247,19 @@ EOF
                 existing_format=$(packaging_format_for_name "${existing_path##*/}")
             fi
             if [[ -n "$existing_format" && "$existing_format" == "$format" ]]; then
-
-                if [[ -n "$existing_path" && "$format" != "binary" ]]; then
-                    # A matching name or format does not prove that the lane
-                    # finished writing an archive. Validate its full payload
-                    # and any configured include_files before reusing bytes.
-                    _build_package_archive_for_target "$tool" "$version" "$target" \
-                        "$output_dir" "$repo_path" "$binary_name" "$existing_path" "$primary_triple" || return 1
-                    if [[ -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
-                        existing_path="$output_dir/$versioned_name"
+                _build_package_archive_for_target "$tool" "$version" "$target" \
+                    "$output_dir" "$repo_path" "$binary_name" "$existing_path" "$primary_triple" || return 1
+                # A legacy installer can additionally name a loose executable
+                # beside the prebuilt archive.
+                if [[ -n "$compat_name" ]] && ! _build_is_archive_ext "$compat_name"; then
+                    local binary_path
+                    binary_path=$(_build_find_binary "$output_dir" "$binary_name" "$os" 2>/dev/null || echo "")
+                    if [[ -n "$binary_path" ]]; then
+                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$primary_triple" || collect_failed=true
+                    else
+                        log_warn "Binary not found for $tool $target to create compat alias"
                     fi
                 fi
-
-                if [[ -n "$existing_path" ]]; then
-                    if [[ "$format" == "binary" ]]; then
-                        _build_emit_binary_alias "$existing_path" "$compat_name" "$output_dir" "$target" "$primary_triple" || collect_failed=true
-                    elif [[ -n "$compat_name" ]]; then
-                        if _build_is_archive_ext "$compat_name"; then
-                            _build_emit_compat_alias "$existing_path" "$compat_name" "$output_dir" "$target" "$format" "$primary_triple" || collect_failed=true
-                        else
-                            local binary_path
-                            binary_path=$(_build_find_binary "$output_dir" "$binary_name" "$os" 2>/dev/null || echo "")
-                            if [[ -n "$binary_path" ]]; then
-                                _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$primary_triple" || collect_failed=true
-                            else
-                                log_warn "Binary not found for $tool $target to create compat alias"
-                            fi
-                        fi
-                    fi
-                else
-                    log_warn "No existing artifact found for $tool $target to create compat alias"
-                fi
-
-                log_info "Archive already produced for $tool $target ($format); skipping packaging"
                 continue
             fi
 
