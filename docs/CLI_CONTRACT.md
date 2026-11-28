@@ -2505,6 +2505,31 @@ concurrent privileged mutation.
 
 ---
 
+### `dsr release formulas`
+
+`dsr release formulas TOOL VERSION` updates package recipes from a published
+GitHub release. Use `--dry-run` to inspect the exact assets and recipe paths.
+A regular run retains the local commits. Add `--push` to publish them.
+
+```bash
+dsr --json --dry-run release formulas ntm 1.39.0 --homebrew-kind both --skip-scoop
+dsr release formulas franken_code_browser 0.1.0 --package-name franken-code-browser --homebrew-kind cask --skip-scoop --push
+```
+
+`--homebrew-kind` selects `formula`, `cask`, or `both`. The default is
+`formula`. Set `formulas.homebrew_kind` and `formulas.package_name` in the
+tool's `repos.d` YAML to persist its selection. With `both`, DSR verifies
+every selected formula and cask download before writing either recipe, and
+commits both paths together in the tap. The JSON result lists them in
+`details.homebrew.paths`. Cross-repository tap and Scoop pushes have separate
+results.
+
+DSR reads cask metadata without executing Ruby. It supports literal version
+and SHA-256 values and a single download URL per platform scope, including
+URLs that interpolate `#{version}`. Formula resources that download companion
+files from the tool's own release receive their new URLs and verified hashes
+alongside the primary command. Third-party resources retain their own pins.
+
 ### `dsr release checksums`
 
 Audit a complete release, synchronize its checksums to downstream repositories,

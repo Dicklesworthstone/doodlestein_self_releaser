@@ -558,7 +558,83 @@ RUBY
         ".details.homebrew.status == \"unchanged\" and .details.homebrew.commit == \"$published\" and (.details.assets|length)==2"
 }
 
+formula_cask_cases() {
+    seed homebrew-casks || return 1
+    local original final hash
+    mkdir -p "$CASE/homebrew-source/Casks" "$CASE/config/repos.d" || return 1
+    cat > "$CASE/homebrew-source/Casks/tool.rb" <<'RUBY'
+cask "tool" do
+  version "1.0.0"
+  on_macos do
+    on_arm do
+      sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      url "https://github.com/owner/tool/releases/download/v#{version}/tool-#{version}-aarch64-apple-darwin.tar.gz"
+    end
+    on_intel do
+      url "https://github.com/owner/tool/releases/download/v1.0.0/tool-1.0.0-x86_64-apple-darwin.tar.gz"
+      sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    end
+  end
+  app "Tool.app"
+  livecheck do
+    skip "Generated on release"
+  end
+end
+RUBY
+    command git -C "$CASE/homebrew-source" add Casks/tool.rb || return 1
+    command git -C "$CASE/homebrew-source" commit -qm 'Seed the multi-architecture cask' || return 1
+    command git -C "$CASE/homebrew-source" push -q "$CASE/homebrew.git" HEAD:refs/heads/main || return 1
+    original=$(remote_sha homebrew)
+    printf 'formulas:\n  homebrew_kind: cask\n' > "$CASE/config/repos.d/tool.yaml"
+    invoke true --skip-scoop
+    check 'configured cask preview selects the cask and both architectures' json_is "$CASE/output.json" \
+        '.details.homebrew.paths==["Casks/tool.rb"] and (.details.assets|length)==2'
+    check 'cask preview never clones or writes the tap' test ! -s "$GIT_CALLS"
+    invoke false --skip-scoop --push --homebrew-kind both
+    check 'combined formula and cask update succeeds' equal "$RESULT" 0
+    final=$(remote_sha homebrew)
+    check 'both recipes ship in a single tap commit' equal \
+        "$(command git --git-dir="$CASE/homebrew.git" diff-tree --no-commit-id --name-only -r "$final")" $'Casks/tool.rb\nFormula/tool.rb'
+    check 'receipt identifies both recipes and their exact commit' json_is "$CASE/output.json" \
+        ".details.homebrew.paths==[\"Formula/tool.rb\",\"Casks/tool.rb\"] and .details.homebrew.commit==\"$final\" and .details.pushed"
+    check 'shared download verified only once per operation' equal "$(grep -c '^download .* 11$' "$API_CALLS")" 2
+    command git --git-dir="$CASE/homebrew.git" show main:Casks/tool.rb > "$CASE/shipped-cask.rb" || return 1
+    check 'updated cask has both verified digests and the selected version' equal \
+        "$(grep -c "sha256 \"$HASH\"" "$CASE/shipped-cask.rb")/$(grep -c 'version "1.0.1"' "$CASE/shipped-cask.rb")" '2/1'
+    check 'cask app and livecheck survive rendering' grep -Fq 'app "Tool.app"' "$CASE/shipped-cask.rb"
+    invoke false --skip-scoop --push --homebrew-kind both
+    check 'joint retry is idempotent' json_is "$CASE/output.json" \
+        ".details.homebrew.commit==\"$final\" and .details.homebrew.status==\"unchanged\""
+    # A tap with no formula can publish a cask on its own. Also verify that a
+    # malformed cask cannot cause a partial update of an otherwise valid tap.
+    command git -C "$CASE/homebrew-source" fetch -q "$CASE/homebrew.git" main || return 1
+    command git -C "$CASE/homebrew-source" merge -q --ff-only FETCH_HEAD || return 1
+    mkdir "$CASE/homebrew-source/parked" || return 1
+    command git -C "$CASE/homebrew-source" mv Formula/tool.rb parked/tool.rb || return 1
+    command git -C "$CASE/homebrew-source" checkout "$original" -- Casks/tool.rb || return 1
+    command git -C "$CASE/homebrew-source" commit -qm 'Seed cask-only layout' || return 1
+    command git -C "$CASE/homebrew-source" push -q "$CASE/homebrew.git" HEAD:refs/heads/main || return 1
+    invoke false --skip-scoop --push
+    check 'cask-only repository successfully publishes by config' json_is "$CASE/output.json" \
+        '.details.homebrew.path=="Casks/tool.rb" and .details.homebrew.pushed'
+    command git -C "$CASE/homebrew-source" fetch -q "$CASE/homebrew.git" main || return 1
+    command git -C "$CASE/homebrew-source" merge -q --ff-only FETCH_HEAD || return 1
+    command git -C "$CASE/homebrew-source" checkout "$original" -- Formula/tool.rb || return 1
+    sed 's/cask "tool"/cask "someone-else"/' "$CASE/shipped-cask.rb" > "$CASE/homebrew-source/Casks/tool.rb"
+    command git -C "$CASE/homebrew-source" commit -qam 'Seed mismatched cask' || return 1
+    command git -C "$CASE/homebrew-source" push -q "$CASE/homebrew.git" HEAD:refs/heads/main || return 1
+    original=$(remote_sha homebrew)
+    invoke false --push --homebrew-kind both
+    check 'mismatched cask token refuses the joint update' nonzero "$RESULT"
+    check 'a refused cask leaves both the formula and cask untouched' equal "$(remote_sha homebrew)" "$original"
+    check 'a refused cask leaves the bucket untouched' equal "$(command git --git-dir="$CASE/scoop.git" rev-list --count main)" 1
+    printf 'formulas:\n  homebrew_kind: ["cask"]\n' > "$CASE/config/repos.d/tool.yaml"
+    invoke true --skip-scoop
+    check 'malformed kind setting is refused before recipe selection' equal "$RESULT" 4
+}
+
 case "${FORMULAS_TEST_SCOPE:-all}" in
+    homebrew-casks) formula_cask_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     release-companion) formula_companion_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     partial-rows) formula_partial_inventory_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     package-alias) formula_package_alias_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
@@ -807,6 +883,7 @@ formula_scoop_layout_cases || exit 1
 formula_package_alias_cases || exit 1
 formula_partial_inventory_cases || exit 1
 formula_companion_cases || exit 1
+formula_cask_cases || exit 1
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

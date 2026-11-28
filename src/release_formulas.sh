@@ -136,22 +136,33 @@ _formulas_fetch_scoop() {
 # methods cannot be mistaken for the application's download metadata.
 _formulas_homebrew() {
     local mode="$1" recipe="$2" plan="$3" version="$4" repo="${5:-}"
-    ruby - "$mode" "$recipe" "$plan" "$version" "$repo" <<'RUBY'
+    ruby - "$mode" "$recipe" "$plan" "$version" "$repo" "${6:-formula}" "${7:-}" <<'RUBY'
 require "json"
 require "ripper"
-mode, path, plan_path, new_version, repo = ARGV
+mode, path, plan_path, new_version, repo, kind, package_name = ARGV
 begin
   source = File.binread(path)
   ast = Ripper.sexp(source)
   raise "invalid Ruby formula" unless ast && ast[0] == :program
-  classes = ast[1].select { |n| n.is_a?(Array) && n[0] == :class }
-  superclass = classes.first&.[](2)
-  raise "expected one Formula subclass" unless classes.length == 1 &&
-    superclass && superclass[0] == :var_ref && superclass[1][0..1] == [:@const, "Formula"]
-  # Ruby's superclass AST is a var_ref; reject other inheritance forms rather
-  # than loading Homebrew or executing a formula to discover its structure.
-  root = classes[0][3]
-  raise "unsupported class body" unless root[0] == :bodystmt && root[2..4].all?(&:nil?)
+  if kind == "cask"
+    declaration = ast[1].first
+    raise "expected a single cask declaration" unless ast[1].length == 1 && declaration[0] == :method_add_block
+    call, body = declaration[1..2]
+    literal = call.dig(2, 1, 0, 1)
+    raise "unexpected cask token" unless call[0] == :command && call[1][0..1] == [:@ident, "cask"] &&
+      call[2][0] == :args_add_block && call[2][1].length == 1 && call[2][2] == false &&
+      literal.is_a?(Array) && literal.length == 2 && literal[0] == :string_content &&
+      literal[1][0..1] == [:@tstring_content, package_name]
+    raise "unsupported cask body" unless body[0] == :do_block && body[1].nil?
+    root = body[2]
+  else
+    classes = ast[1].select { |n| n.is_a?(Array) && n[0] == :class }
+    superclass = classes.first&.[](2)
+    raise "expected one Formula subclass" unless classes.length == 1 &&
+      superclass && superclass[0] == :var_ref && superclass[1][0..1] == [:@const, "Formula"]
+    root = classes[0][3]
+  end
+  raise "unsupported recipe body" unless root[0] == :bodystmt && root[2..4].all?(&:nil?)
   lines = source.lines
   offsets = [0]
   lines.each { |line| offsets << offsets[-1] + line.bytesize }
@@ -214,16 +225,26 @@ begin
   walk = nil
   walk = lambda do |statements|
     return unless statements
+    if kind == "cask"
+      urls = statements.select { |s| simple_call.call(s, "url") }
+      hashes = statements.select { |s| simple_call.call(s, "sha256") }
+      unless urls.empty? && hashes.empty?
+        raise "each cask platform scope must have one URL and one SHA-256" unless urls.one? && hashes.one?
+        downloads << [string_arg.call(urls.first), string_arg.call(hashes.first)]
+      end
+    end
     statements.each_with_index do |node, index|
       next unless node.is_a?(Array)
       if simple_call.call(node, "version")
         value = string_arg.call(node)
         versions << [decode.call(value[0], nil), value[1], value[2]]
       elsif simple_call.call(node, "url")
+        next if kind == "cask"
         following = statements[index + 1]
         raise "each application URL must be followed by its literal sha256" unless simple_call.call(following, "sha256")
         downloads << [string_arg.call(node), string_arg.call(following)]
       elsif simple_call.call(node, "sha256")
+        next if kind == "cask"
         raise "unpaired application sha256" unless index > 0 && simple_call.call(statements[index - 1], "url")
       elsif node[0] == :method_add_block
         name = block_name.call(node[1])
@@ -270,6 +291,7 @@ begin
   old_versions = versions.map(&:first).uniq
   raise "conflicting application versions" if old_versions.length > 1
   old_version = old_versions.first
+  raise "cask must declare its version" if kind == "cask" && (old_version.nil? || old_version.empty?)
   urls = downloads.map { |pair| decode.call(pair[0][0], old_version) }
   downloads.each do |pair|
     hash = decode.call(pair[1][0], nil)
@@ -505,12 +527,13 @@ _formulas_revalidate() {
 
 cmd_release_formulas() (
     local tool_name="" version="" package_name="" homebrew_tap="" scoop_bucket=""
+    local homebrew_kind=""
     local skip_homebrew=false skip_scoop=false push_changes=false
     local dry_run="${DRY_RUN:-false}" start_time
     start_time=$(date +%s)
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --tool|-t|--version|-V|--package-name|--homebrew-tap|--scoop-bucket)
+            --tool|-t|--version|-V|--package-name|--homebrew-kind|--homebrew-tap|--scoop-bucket)
                 if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
                     _formulas_error 4 "Missing value for $1"; return 4
                 fi
@@ -518,6 +541,7 @@ cmd_release_formulas() (
                     --tool|-t) tool_name="$2" ;;
                     --version|-V) version="$2" ;;
                     --package-name) package_name="$2" ;;
+                    --homebrew-kind) homebrew_kind="$2" ;;
                     --homebrew-tap) homebrew_tap="$2" ;;
                     --scoop-bucket) scoop_bucket="$2" ;;
                 esac
@@ -536,6 +560,7 @@ OPTIONS:
     -t, --tool <name>          Configured tool
     -V, --version <tag>        Published release tag
     --package-name <name>      Recipe basename for both managers (e.g. ee)
+    --homebrew-kind <kind>     Update formula (default), cask, or both in one tap commit
     --homebrew-tap <repo>      Override configured Homebrew repository
     --scoop-bucket <repo>      Override configured Scoop repository
     --skip-homebrew            Update Scoop only
@@ -550,6 +575,7 @@ exists, otherwise <name>.json at the repository root.
 The package name defaults to formulas.package_name in repos.d/<tool>.yaml,
 then to the tool key. It selects only the recipe filenames. Release assets
 must still belong to the tool's configured GitHub repository.
+Set formulas.homebrew_kind in the tool recipe to persist the selection.
 Local commits and evidence are retained under XDG state when not a dry run.
 HELP
                 return 0 ;;
@@ -583,8 +609,8 @@ HELP
         return "$authentication_status"
     fi
     act_load_repo_config "$tool_name" >/dev/null || { _formulas_error 4 "Tool not found: $tool_name"; return 4; }
+    local tool_config="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}/$tool_name.yaml"
     if [[ -z "$package_name" ]]; then
-        local tool_config="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}/$tool_name.yaml"
         if [[ -f "$tool_config" ]]; then
             # Validate the typed value before emitting shell text: a sequence,
             # null member or trailing newline cannot silently redirect a write.
@@ -602,6 +628,17 @@ HELP
             package_name="$tool_name"
         fi
     fi
+    if [[ -z "$homebrew_kind" && -f "$tool_config" && "$skip_homebrew" == false ]]; then
+        homebrew_kind=$(yq -o=json -I=0 '.formulas' "$tool_config" |
+            jq -ers 'select(length==1) | .[0] |
+              if . == null then "formula" elif type == "object" then
+                if has("homebrew_kind") then .homebrew_kind else "formula" end else empty end |
+              select(. == "formula" or . == "cask" or . == "both")') || {
+            _formulas_error 4 "Invalid formulas.homebrew_kind for $tool_name"; return 4
+        }
+    fi
+    homebrew_kind="${homebrew_kind:-formula}"
+    case "$homebrew_kind" in formula|cask|both) ;; *) _formulas_error 4 "Expected Homebrew kind formula, cask or both"; return 4 ;; esac
     local repo tag release release_id source_sha config_file status=0
     repo=$(act_get_repo "$tool_name") || return 4
     [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
@@ -658,43 +695,55 @@ HELP
     $skip_homebrew || managers+=(homebrew)
     $skip_scoop || managers+=(scoop)
     local -A repositories=([homebrew]="$homebrew_tap" [scoop]="$scoop_bucket")
-    local -A paths=([homebrew]="Formula/$package_name.rb" [scoop]="bucket/$package_name.json")
-    local manager recipe path kind
+    local -a brew_paths=() selected_paths=()
+    [[ "$homebrew_kind" == cask ]] || brew_paths+=("Formula/$package_name.rb")
+    [[ "$homebrew_kind" == formula ]] || brew_paths+=("Casks/$package_name.rb")
+    local -A rendered=()
+    local manager recipe path kind slot recipe_kind scoop_path="bucket/$package_name.json"
     # Complete preflight for EVERY requested manager before making any commit.
     for manager in "${managers[@]}"; do
-        path="${paths[$manager]}"
-        if [[ "$dry_run" == "true" ]]; then
-            recipe="$work/$manager.original"
-            if [[ "$manager" == scoop ]]; then
-                path=$(_formulas_fetch_scoop "${repositories[$manager]}" "$package_name.json" "$recipe") || status=$?
-            else
-                _formulas_fetch_recipe "${repositories[$manager]}" "$path" "$recipe" || status=$?
-            fi
-        else
+        if [[ "$dry_run" != true ]]; then
             _formulas_git clone --depth 1 --no-recurse-submodules --template= -- "https://github.com/${repositories[$manager]}.git" \
                 "$work/$manager" >&2 || status=$?
+            if ((status != 0)); then
+                _formulas_operation_error "$status" 1 "Cannot clone $manager repository; no repositories were pushed" "$work"; return $?
+            fi
             if [[ "$manager" == scoop && ! -e "$work/scoop/bucket" && ! -L "$work/scoop/bucket" ]]; then
-                path="$package_name.json"
-            fi
-            recipe="$work/$manager/$path"
-            if [[ $status -eq 0 && ( -L "$work/$manager/${path%%/*}" || -L "$recipe" || ! -f "$recipe" ) ]]; then
-                status=4
+                scoop_path="$package_name.json"
             fi
         fi
-        if [[ $status -ne 0 ]]; then
-            _formulas_operation_error "$status" 1 "Cannot load $manager recipe; no repositories were pushed" "$work"; return $?
-        fi
-        paths[$manager]="$path"
-        "_formulas_$manager" scan "$recipe" "$work/plan.json" "${tag#v}" "$repo" > "$work/$manager.scan.json" || status=$?
-        if ((status == 0)); then
-            _formulas_plan_assets "$repo" "$tag" "$release_id" "$work/$manager.scan.json" "$work" || status=$?
-        fi
-        if ((status == 0)); then
-            "_formulas_$manager" apply "$recipe" "$work/plan.json" "${tag#v}" "$repo" > "$work/$manager.updated" || status=$?
-        fi
-        if ((status != 0)); then
-            _formulas_operation_error "$status" 1 "Cannot verify/render $manager recipe; no repositories were pushed" "$work"; return $?
-        fi
+        selected_paths=("${brew_paths[@]}")
+        [[ "$manager" != scoop ]] || selected_paths=("$scoop_path")
+        for path in "${selected_paths[@]}"; do
+            recipe_kind=formula slot="$work/$manager"
+            if [[ "$path" == Casks/* ]]; then recipe_kind=cask; slot="$work/$manager.cask"; fi
+            if [[ "$dry_run" == true ]]; then
+                recipe="$slot.original"
+                if [[ "$manager" == scoop ]]; then
+                    scoop_path=$(_formulas_fetch_scoop "${repositories[$manager]}" "$package_name.json" "$recipe") || status=$?
+                    path="$scoop_path"
+                else
+                    _formulas_fetch_recipe "${repositories[$manager]}" "$path" "$recipe" || status=$?
+                fi
+            else
+                recipe="$work/$manager/$path"
+                if [[ -L "$work/$manager/${path%%/*}" || -L "$recipe" || ! -f "$recipe" ]]; then status=4; fi
+            fi
+            if ((status != 0)); then
+                _formulas_operation_error "$status" 1 "Cannot load $manager recipe; no repositories were pushed" "$work"; return $?
+            fi
+            rendered[$path]="$slot.updated"
+            "_formulas_$manager" scan "$recipe" "$work/plan.json" "${tag#v}" "$repo" "$recipe_kind" "$package_name" > "$slot.scan.json" || status=$?
+            if ((status == 0)); then
+                _formulas_plan_assets "$repo" "$tag" "$release_id" "$slot.scan.json" "$work" || status=$?
+            fi
+            if ((status == 0)); then
+                "_formulas_$manager" apply "$recipe" "$work/plan.json" "${tag#v}" "$repo" "$recipe_kind" "$package_name" > "$slot.updated" || status=$?
+            fi
+            if ((status != 0)); then
+                _formulas_operation_error "$status" 1 "Cannot verify/render $path; no repositories were pushed" "$work"; return $?
+            fi
+        done
     done
     _formulas_revalidate "$repo" "$tag" "$release_id" "$source_sha" "$work/plan.json" || status=$?
     if ((status != 0)); then
@@ -706,17 +755,20 @@ HELP
     for manager in "${managers[@]}"; do
         status=0 changed=false branch="" commit="" kind=planned
         operation_status=0 push_attempted=false push_outcome=not_attempted
-        path="${paths[$manager]}"
+        selected_paths=("${brew_paths[@]}")
+        [[ "$manager" != scoop ]] || selected_paths=("$scoop_path")
         if [[ "$dry_run" != "true" ]]; then
-            recipe="$work/$manager/$path"
             branch=$(_formulas_git -C "$work/$manager" symbolic-ref --short HEAD) || status=$?
             if [[ $status -eq 0 ]]; then
-                if ! cmp -s "$recipe" "$work/$manager.updated"; then
-                    changed=true
-                    cp "$work/$manager.updated" "$recipe" || status=$?
-                    if [[ $status -eq 0 ]]; then
-                        _formulas_git -C "$work/$manager" add -- "$path" >&2 || status=$?
+                for path in "${selected_paths[@]}"; do
+                    recipe="$work/$manager/$path"
+                    if ! cmp -s "$recipe" "${rendered[$path]}"; then
+                        changed=true
+                        cp "${rendered[$path]}" "$recipe" || { status=$?; break; }
                     fi
+                done
+                if $changed && ((status == 0)); then
+                    _formulas_git -C "$work/$manager" add -- "${selected_paths[@]}" >&2 || status=$?
                     if [[ $status -eq 0 ]]; then
                         _formulas_git -C "$work/$manager" commit -m "Update $package_name to ${tag#v}" >&2 || status=$?
                     fi
@@ -753,13 +805,13 @@ HELP
         fi
         if [[ $status -eq 0 ]]; then successes=$((successes + 1)); else failures=$((failures + 1)); fi
         result=$(jq -nc --arg status "$kind" --arg repo "${repositories[$manager]}" \
-            --arg path "${paths[$manager]}" --arg branch "$branch" --arg commit "$commit" \
+            --arg branch "$branch" --arg commit "$commit" \
             --argjson code "$status" --argjson changed "$changed" --argjson operation "$operation_status" \
             --argjson attempted "$push_attempted" --arg outcome "$push_outcome" \
-            '{status:$status,repo:$repo,path:$path,branch:$branch,commit:$commit,
+            --args '{status:$status,repo:$repo,path:$ARGS.positional[0],paths:$ARGS.positional,branch:$branch,commit:$commit,
               updated:($changed and $code == 0),pushed:($status == "pushed"),exit_code:$code,
               operation_exit_code:$operation,push_attempted:$attempted,push_outcome:$outcome,
-              error:(if $code == 0 then null else $status end)}') || return 4
+              error:(if $code == 0 then null else $status end)}' "${selected_paths[@]}") || return 4
         results=$(jq -nc --argjson results "$results" --arg manager "$manager" \
             --argjson result "$result" '$results + {($manager):$result}') || return 4
         # A stopped write may already have committed remotely. Retain the
