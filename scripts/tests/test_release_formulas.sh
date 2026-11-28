@@ -167,6 +167,7 @@ gh_download_release_asset() {
     [[ ! -e "$3" ]] || return 4
     if [[ "$SCENARIO" == wrong-bytes ]]; then printf 'altered release bytes!\n' > "$3"
     elif [[ "$SCENARIO" == release-companion && "$2" == 26 ]]; then cp "$CASE/daemon" "$3"
+    elif [[ "$SCENARIO" == arch-cask && "$2" == 12 ]]; then cp "$CASE/intel" "$3"
     else cp "$CASE/payload" "$3"; fi
 }
 gh_api() {
@@ -633,7 +634,61 @@ RUBY
     check 'malformed kind setting is refused before recipe selection' equal "$RESULT" 4
 }
 
+formula_arch_cask_cases() {
+    seed arch-cask || return 1
+    local intel_hash size initial published
+    printf 'different Intel disk image\n' > "$CASE/intel"
+    intel_hash=$(_gh_asset_sha256 "$CASE/intel")
+    size=$(wc -c < "$CASE/intel")
+    jq --arg hash "$intel_hash" --argjson size "$size" 'map(if .id==12 then
+        .size=$size | .digest=("sha256:"+$hash) else . end)' "$CASE/assets.json" > "$CASE/complete.json" || return 1
+    mkdir -p "$CASE/homebrew-source/Casks" || return 1
+    cat > "$CASE/homebrew-source/Casks/tool.rb" <<'RUBY'
+cask "tool" do
+  arch arm: "aarch64", intel: "x86_64"
+  version "1.0.0"
+  sha256 arm: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         x86_64: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  url "https://github.com/owner/tool/releases/download/v#{version}/tool-#{version}-#{arch}-apple-darwin.tar.gz"
+  app "Tool.app"
+end
+RUBY
+    command git -C "$CASE/homebrew-source" add Casks/tool.rb || return 1
+    command git -C "$CASE/homebrew-source" commit -qm 'Seed architecture-interpolated cask' || return 1
+    command git -C "$CASE/homebrew-source" push -q "$CASE/homebrew.git" HEAD:refs/heads/main || return 1
+    initial=$(remote_sha homebrew)
+    jq 'map(select(.id!=12))' "$CASE/complete.json" > "$CASE/assets.json" || return 1
+    invoke false --skip-scoop --homebrew-kind cask --push
+    check 'missing Intel download holds every cask architecture' nonzero "$RESULT"
+    check 'partial architecture inventory leaves tap unchanged' equal "$(remote_sha homebrew)" "$initial"
+    cp "$CASE/complete.json" "$CASE/assets.json" || return 1
+    invoke true --skip-scoop --homebrew-kind cask
+    check 'preview expands the two template URLs into separate verified digests' json_is "$CASE/output.json" \
+        "([.details.assets[].sha256]|sort)==([\"$HASH\",\"$intel_hash\"]|sort)"
+    invoke false --skip-scoop --homebrew-kind cask --push
+    check 'architecture-mapped cask publishes' equal "$RESULT" 0
+    published=$(remote_sha homebrew)
+    command git --git-dir="$CASE/homebrew.git" show main:Casks/tool.rb > "$CASE/shipped.rb" || return 1
+    check 'published cask retains the architecture and version expressions' grep -Fq '#{version}-#{arch}-apple-darwin' "$CASE/shipped.rb"
+    check 'published ARM keyword binds the ARM bytes' grep -Fq "arm: \"$HASH\"" "$CASE/shipped.rb"
+    check 'published Intel keyword binds different Intel bytes' grep -Fq "x86_64: \"$intel_hash\"" "$CASE/shipped.rb"
+    check 'published architecture cask selects the new version' grep -Fq 'version "1.0.1"' "$CASE/shipped.rb"
+    invoke false --skip-scoop --homebrew-kind cask --push
+    check 'revalidating the template is idempotent' json_is "$CASE/output.json" \
+        ".details.homebrew.status==\"unchanged\" and .details.homebrew.commit==\"$published\""
+    sed 's/x86_64: "/arm64_linux: "/' "$CASE/shipped.rb" > "$CASE/bad.rb"
+    check 'unsupported platform keyword cannot be partially rewritten' bash -c \
+        'source "$1"; ! _formulas_homebrew scan "$2" /dev/null 1.0.1 owner/tool cask tool' \
+        _ "${FORMULAS_TEST_MODULE:-$PROJECT_ROOT/src/release_formulas.sh}" "$CASE/bad.rb"
+    sed -e 's/arch arm: "aarch64", intel: "x86_64"/arch arm: "-arm64"/' \
+        -e 's/-#{arch}-apple-darwin.tar.gz/#{arch}.dmg/' "$CASE/shipped.rb" > "$CASE/suffix.rb"
+    _formulas_homebrew scan "$CASE/suffix.rb" /dev/null 1.0.1 owner/tool cask tool > "$CASE/suffix.json" || return 1
+    check 'omitted Intel suffix matches Ruby interpolation' json_is "$CASE/suffix.json" \
+        '(.urls | map(split("/")[-1]) | sort) == ["tool-1.0.1-arm64.dmg","tool-1.0.1.dmg"]'
+}
+
 case "${FORMULAS_TEST_SCOPE:-all}" in
+    arch-casks) formula_arch_cask_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     homebrew-casks) formula_cask_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     release-companion) formula_companion_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     partial-rows) formula_partial_inventory_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
@@ -884,6 +939,7 @@ formula_package_alias_cases || exit 1
 formula_partial_inventory_cases || exit 1
 formula_companion_cases || exit 1
 formula_cask_cases || exit 1
+formula_arch_cask_cases || exit 1
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

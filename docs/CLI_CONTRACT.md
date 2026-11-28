@@ -2526,7 +2526,11 @@ results.
 
 DSR reads cask metadata without executing Ruby. It supports literal version
 and SHA-256 values and a single download URL per platform scope, including
-URLs that interpolate `#{version}`. Formula resources that download companion
+URLs that interpolate `#{version}`. A cask can also declare its architecture
+names with `arch arm: "...", intel: "..."`, use `#{arch}` in one shared URL,
+and pin each architecture with a separate SHA-256 keyword. DSR preserves
+that URL template after checking its expansion against both new assets.
+Formula resources that download companion
 files from the tool's own release receive their new URLs and verified hashes
 alongside the primary command. Third-party resources retain their own pins.
 

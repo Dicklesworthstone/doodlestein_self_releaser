@@ -174,12 +174,9 @@ begin
   simple_call = lambda do |node, name|
     node.is_a?(Array) && node[0] == :command && node[1][0] == :@ident && node[1][1] == name
   end
-  string_arg = lambda do |node|
-    args = node[2]
-    raise "metadata must have one string argument" unless args[0] == :args_add_block &&
-      args[2] == false && args[1].length == 1 && args[1][0][0] == :string_literal
-    ident_pos = node[1][2]
-    start_index = tokens.index { |t| t[0] == ident_pos && t[1] == :on_ident }
+  string_literal = lambda do |node, position|
+    raise "expected a literal metadata string" unless node[0] == :string_literal
+    start_index = tokens.index { |t| t[0] == position && [:on_ident, :on_label].include?(t[1]) }
     raise "missing metadata token" unless start_index
     first = start_index + 1
     first += 1 while tokens[first] && tokens[first][1] == :on_sp
@@ -190,21 +187,52 @@ begin
     raise "unterminated metadata string" unless tokens[last]
     start = offsets[tokens[first][0][0] - 1] + tokens[first][0][1]
     finish = offsets[tokens[last][0][0] - 1] + tokens[last][0][1] + tokens[last][2].bytesize
-    [args[1][0][1], start, finish]
+    [node[1], start, finish]
   end
-  decode = lambda do |content, version|
+  string_arg = lambda do |node|
+    args = node[2]
+    raise "metadata must have one string argument" unless args[0] == :args_add_block &&
+      args[2] == false && args[1].length == 1
+    string_literal.call(args[1][0], node[1][2])
+  end
+  arch_values = lambda do |node, checksum|
+    args = node[2]
+    raise "expected architecture keywords" unless args[0] == :args_add_block && args[2] == false &&
+      args[1].length == 1 && args[1][0][0] == :bare_assoc_hash
+    args[1][0][1].each_with_object({}) do |field, result|
+      op, label, value = field
+      raise "expected a literal architecture keyword" unless op == :assoc_new && label[0] == :@label
+      key = label[1].delete_suffix(":")
+      key = "intel" if checksum && key == "x86_64"
+      raise "duplicate or unsupported architecture #{key}" unless %w[arm intel].include?(key) && !result.key?(key)
+      result[key] = string_literal.call(value, label[2])
+    end
+  end
+  decode = lambda do |content, version, arch = nil|
     raise "unsupported string syntax" unless content[0] == :string_content
     content.drop(1).map do |part|
       if part[0] == :@tstring_content
         raise "escaped metadata strings are unsupported" if part[1].include?("\\")
         part[1]
-      elsif version && part[0] == :string_embexpr && part[1].length == 1 &&
-          part[1][0][0] == :vcall && part[1][0][1][0..1] == [:@ident, "version"]
-        version
+      elsif part[0] == :string_embexpr && part[1].length == 1 && part[1][0][0] == :vcall
+        {"version" => version, "arch" => arch}.fetch(part[1][0][1][1]) ||
+          raise("undefined interpolation in release metadata")
       else
         raise "only literal strings and the version interpolation are supported"
       end
     end.join
+  end
+  architectures = {}
+  if kind == "cask"
+    declared = root[1].select { |s| simple_call.call(s, "arch") }
+    raise "duplicate cask arch stanza" if declared.length > 1
+    if declared.first
+      architectures = arch_values.call(declared.first, false).transform_values do |literal|
+        name = decode.call(literal[0], nil)
+        raise "invalid architecture filename component" unless name.match?(/\A[A-Za-z0-9._+-]*\z/)
+        name
+      end
+    end
   end
   block_name = lambda do |call|
     call = call[1] if call[0] == :method_add_arg
@@ -230,7 +258,16 @@ begin
       hashes = statements.select { |s| simple_call.call(s, "sha256") }
       unless urls.empty? && hashes.empty?
         raise "each cask platform scope must have one URL and one SHA-256" unless urls.one? && hashes.one?
-        downloads << [string_arg.call(urls.first), string_arg.call(hashes.first)]
+        url = string_arg.call(urls.first)
+        if hashes.first.dig(2, 1, 0, 0) == :bare_assoc_hash
+          pins = arch_values.call(hashes.first, true)
+          raise "architecture and checksum selections differ" if architectures.empty? || !(architectures.keys - pins.keys).empty?
+          # Homebrew returns nil for an omitted arch keyword. String
+          # interpolation renders it as an empty suffix on that architecture.
+          pins.each { |key, pin| downloads << [url, pin, architectures.fetch(key, "")] }
+        else
+          downloads << [url, string_arg.call(hashes.first)]
+        end
       end
     end
     statements.each_with_index do |node, index|
@@ -292,7 +329,7 @@ begin
   raise "conflicting application versions" if old_versions.length > 1
   old_version = old_versions.first
   raise "cask must declare its version" if kind == "cask" && (old_version.nil? || old_version.empty?)
-  urls = downloads.map { |pair| decode.call(pair[0][0], old_version) }
+  urls = downloads.map { |url, _, arch| decode.call(url[0], old_version, arch) }
   downloads.each do |pair|
     hash = decode.call(pair[1][0], nil)
     raise "application sha256 must be a 64-digit literal" unless hash.match?(/\A[0-9a-fA-F]{64}\z/)
@@ -305,7 +342,14 @@ begin
       asset = plan.fetch(url) { raise "no verified replacement for #{url}" }
       raise "invalid verified asset" unless asset["url"].is_a?(String) &&
         asset["sha256"].is_a?(String) && asset["sha256"].match?(/\A[0-9a-f]{64}\z/)
-      edits << [pair[0][1], pair[0][2], asset["url"].dump]
+      if pair[2]
+        # Both architectures use this one Ruby string. Preserve the template
+        # only after proving it expands to each separately verified new URL.
+        raise "cask URL template disagrees with the verified asset" unless
+          decode.call(pair[0][0], new_version, pair[2]) == asset["url"]
+      else
+        edits << [pair[0][1], pair[0][2], asset["url"].dump]
+      end
       edits << [pair[1][1], pair[1][2], asset["sha256"].dump]
     end
     versions.each { |_, start, finish| edits << [start, finish, new_version.dump] }
