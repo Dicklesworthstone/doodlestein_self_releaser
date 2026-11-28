@@ -73,6 +73,7 @@ Each recipe may include an optional `files` list alongside its `executables`:
 "files": [
   {"path": "share/demo/runtime.json", "artifact": "runtime.json"},
   {"path": "lib/libdemo.so.1", "artifact": "demo-linux.tar.gz", "member": "lib/libdemo.so.1"},
+  {"path": "libexec/demo-worker", "artifact": "demo-linux.tar.gz", "member": "helpers/demo-worker"},
   {"path": "share/demo/docs/help.txt", "artifact": "demo-linux.tar.gz", "member": "docs/help.txt"}
 ]
 ```
@@ -81,17 +82,19 @@ The JSON file can come from a signed release-wide `additional` asset.
 The application-private library must come from the selected platform and,
 when a compiler variant is requested, match its signed compiler identity.
 The library's installed filename can match its SONAME so a binary linked
-with `$ORIGIN/../lib` can load it. These files are installed with fixed
-mode **0644**, and their required directories
-receive **0755**. Executables keep mode **0755**. Select each file explicitly;
+with `$ORIGIN/../lib` can load it. Data files and libraries receive mode
+**0644**. A helper under `libexec/` follows the same signed platform and
+compiler selection as a library and receives mode **0755**. Applications
+can invoke the helper by its generation-relative path. Required directories
+and public executables receive **0755**. Select each file explicitly;
 the installer does not copy unlisted archive content, generate configuration,
 run hooks or provide a runtime destination override.
 
-Every destination is a safe relative path beneath `share/` or `lib/`, with at most 256
+Every destination is a safe relative path beneath `share/`, `lib/` or `libexec/`, with at most 256
 files per recipe. The captured installation engine rejects traversal, duplicate
 or case-aliased paths, file/directory collisions, unknown fields and mode
 overrides during generation. Empty archive members are permitted as data;
-libraries and executables must remain nonempty. Omitting `files` or supplying `files: []`
+libraries and executable helpers must remain nonempty. Omitting `files` or supplying `files: []`
 preserves the original executable-only policy and generation identity. A null
 list is invalid. See [runtime data selections](RELEASE_INSTALLATION.md#select-runtime-data)
 for the complete recipe rules.
@@ -106,7 +109,7 @@ checked against data selections during generation and again during installation.
 Applications must locate their data in the installed `share/` tree themselves.
 Successful results include the active and generation-specific paths for each
 selected directory (`share_dir`, `generation_share_dir`, `lib_dir`,
-`generation_lib_dir`) and a `files` inventory with paths, signed targets,
+`generation_lib_dir`, `libexec_dir`, `generation_libexec_dir`) and a `files` inventory with paths, signed targets,
 hashes, sizes and modes. All of
 these selected contents belong to the same generation as the executable family.
 

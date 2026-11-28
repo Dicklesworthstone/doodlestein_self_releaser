@@ -164,6 +164,11 @@ def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False, w
                             "-Wl,-rpath,$ORIGIN/../lib", "-o", str(payload / "app")],
                            input='#include <stdio.h>\nextern int answer(void);\nint main(void){printf("%d\\n",answer());}',
                            text=True, check=True)
+            (payload / "helper").write_text('#!/bin/sh\nexec "${0%/*}/../libexec/worker" "$@"\n')
+            (payload / "private").mkdir()
+            (payload / "private/replacement").write_text('#!/bin/sh\nprintf "helper-v2:%s\\n" "$1"\n')
+            (payload / "private/replacement").chmod(0o644)
+            members.append("private/replacement")
         if with_data:
             (payload / "docs").mkdir()
             (payload / "docs/help.txt").write_text("Owned documentation for " + triple + "\n")
@@ -561,6 +566,55 @@ def runtime_library_cases():
     corrupt = data_state(prefix)
     install("library-retained-drift", snapshot, selected, prefix, 7, policy_targets=matrix)
     check("changed retained library cannot be reused silently", data_state(prefix) == corrupt)
+    private_helper_cases(snapshot, matrix, selected["files"][0])
+
+
+def private_helper_cases(snapshot, matrix, library):
+    archive = "payload-0.tar.gz"
+    selected = dict(schema_version=1, target=target, target_triple=gnu,
+                    executables=[dict(name="tool", artifact=archive, member="helper")],
+                    files=[library, dict(path="libexec/worker", artifact="alias-0")])
+    first, prefix = install("private-helpers", snapshot, selected, policy_targets=matrix)
+    if first.get("status") != "installed":
+        return
+    def execute():
+        clean = {k: v for k, v in env.items() if not k.startswith("LD_")}
+        return subprocess.check_output([prefix / "current/bin/tool", "probe"], env=clean, cwd=work, text=True).strip()
+
+    worker = prefix / "current/libexec/worker"
+    evidence = next(f for f in first["files"] if f["path"] == "libexec/worker")
+    check("public launcher executes private compiled helper using its matching library", execute() == "1" and
+          [p.name for p in (prefix / "current/bin").iterdir()] == ["tool"] and
+          not (prefix / "current/share").exists() and "share_dir" not in first and
+          first.get("libexec_dir") == str(worker.parent) and
+          first.get("generation_libexec_dir") == str(prefix / "generations" / first["generation"] / "libexec") and
+          worker.stat().st_mode & 0o777 == evidence["mode"] == 0o755 and digest(worker) == evidence["sha256"])
+    upgraded = copy.deepcopy(selected)
+    upgraded["files"][1].update(artifact=archive, member="private/replacement")
+    policy = dict(schema_version=1, repo=repo, source_sha=pin, tag=tag, builder=builder, targets=matrix, recipes=[upgraded])
+    script = work / "private-helper-install.sh"
+    invoke([root / "dsr", "--json", "installer", "generate-release", "--policy", save(work / "private-helper.json", policy),
+            "--public-key", public, "--output", script], label="generate private helper installer")
+    result = invoke(["bash", script, "--snapshot", snapshot, "--prefix", prefix, "--replace"],
+                    label="generated private helper upgrade")
+    check("private helper archive member activates with fixed execute permission",
+          result.returncode == 0 and json.loads(result.stdout)["previous_generation"] == first["generation"] and
+          worker.stat().st_mode & 0o777 == 0o755 and execute() == "helper-v2:probe")
+    before = data_state(prefix)
+    for label, fields, status in (
+        ("release-wide", dict(artifact="runtime.json"), 4),
+        ("wrong-abi", dict(artifact="alias-1"), 4),
+        ("empty", dict(artifact=archive, member="docs/EMPTY"), 7),
+    ):
+        bad = dict(upgraded, files=[library, dict(path="libexec/worker", **fields)])
+        install("private-" + label, snapshot, bad, prefix, status, ("--replace",), matrix)
+        check(label + " helper refusal preserves the working launcher", data_state(prefix) == before and execute() == "helper-v2:probe")
+    restored, _ = install("private-helper-rollback", snapshot, selected, prefix, extra=("--replace",), policy_targets=matrix)
+    check("rollback activates original launcher, library and private helper", restored.get("generation") == first["generation"] and execute() == "1")
+    worker.chmod(0o644)
+    drift = data_state(prefix)
+    install("private-helper-mode-drift", snapshot, selected, prefix, 7, policy_targets=matrix)
+    check("changed private helper permissions block generation reuse", data_state(prefix) == drift)
 
 
 if os.environ.get("DSR_INSTALL_DATA_ONLY") != "1":

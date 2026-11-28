@@ -205,6 +205,10 @@ def runtime_target_matches(item, asset_target, platform_target):
     return asset_target == platform_target or (asset_target == "additional" and item["path"].startswith("share/"))
 
 
+def runtime_file_mode(item):
+    return 0o755 if item["path"].startswith("libexec/") else 0o644
+
+
 def recipe(value, contract=None):
     fields = {"schema_version", "target", "executables"}
     need(isinstance(value, dict) and fields <= set(value) <= fields | {"target_triple", "files"} and
@@ -224,7 +228,7 @@ def recipe(value, contract=None):
         destinations = {}
         for item in value["files"]:
             need(isinstance(item, dict) and {"path", "artifact"} <= set(item) <= {"path", "artifact", "member"} and
-                 member(item["path"]) and item["path"].startswith(("share/", "lib/")) and name(item["artifact"]) and
+                 member(item["path"]) and item["path"].startswith(("share/", "lib/", "libexec/")) and name(item["artifact"]) and
                  ("member" not in item or member(item["member"])), "invalid runtime file selection", 4)
             parts = item["path"].split("/")
             for i in range(1, len(parts) + 1):
@@ -355,7 +359,7 @@ def verify_generation(directory, expected):
     for item in files:
         file = plain(directory / item["path"], "file")
         observed = file.stat()
-        need(observed.st_nlink == 1 and stat.S_IMODE(observed.st_mode) == 0o644 and
+        need(observed.st_nlink == 1 and stat.S_IMODE(observed.st_mode) == runtime_file_mode(item) and
              observed.st_size == item["size_bytes"] and digest(file) == item["sha256"],
              "installed runtime file changed: " + item["path"])
 
@@ -600,14 +604,15 @@ try:
             if "member" in item:
                 source /= item["member"]
             plain(source, "file")
-            if item["path"].startswith("lib/"):
-                need(source.stat().st_size > 0, "empty runtime library: " + item["path"])
+            if not item["path"].startswith("share/"):
+                need(source.stat().st_size > 0, "empty runtime library or helper: " + item["path"])
             pin = digest(source)
             dest = staged / item["path"]
-            copy_pinned(source, dest, pin, 0o644)
+            mode = runtime_file_mode(item)
+            copy_pinned(source, dest, pin, mode)
             record = records[item["artifact"]]
             installed_files.append(dict(item, target=record["target"], sha256=pin,
-                                        size_bytes=dest.stat().st_size, mode=0o644))
+                                        size_bytes=dest.stat().st_size, mode=mode))
             if record["target"] != "additional" and "target_triple" in selected:
                 installed_files[-1]["target_triple"] = selected["target_triple"]
         receipt = dict(schema_version=1, kind="dsr-authenticated-install-generation", repository=args.repo, tag=args.tag,
