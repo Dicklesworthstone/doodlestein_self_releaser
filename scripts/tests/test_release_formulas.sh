@@ -166,6 +166,7 @@ gh_download_release_asset() {
     [[ "$SCENARIO" != download-fails ]] || return 8
     [[ ! -e "$3" ]] || return 4
     if [[ "$SCENARIO" == wrong-bytes ]]; then printf 'altered release bytes!\n' > "$3"
+    elif [[ "$SCENARIO" == release-companion && "$2" == 26 ]]; then cp "$CASE/daemon" "$3"
     else cp "$CASE/payload" "$3"; fi
 }
 gh_api() {
@@ -502,7 +503,63 @@ formula_routing_cases() {
     else check 'private formula repository owns its index and objects' false; fi
 }
 
+formula_companion_cases() {
+    seed release-companion || return 1
+    local before published hash size
+    cat > "$CASE/homebrew-source/Formula/tool.rb" <<'RUBY'
+class Tool < Formula
+  version "1.0.0"
+  url "https://github.com/owner/tool/releases/download/v1.0.0/tool-linux-x86_64.tar.gz"
+  sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  resource "tool-daemon" do
+    version "1.0.0"
+    url "https://github.com/owner/tool/releases/download/v#{version}/tool-daemon"
+    sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  end
+  resource "third-party" do
+    version "7.0.0"
+    url "https://github.com/another/tool/releases/download/v7.0.0/helper"
+    sha256 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  end
+  def install
+    resource("tool-daemon").stage { libexec.install "tool-daemon" }
+  end
+end
+RUBY
+    command git -C "$CASE/homebrew-source" commit -qam 'Seed release companion and external resource' || return 1
+    command git -C "$CASE/homebrew-source" push -q "$CASE/homebrew.git" HEAD:refs/heads/main || return 1
+    before=$(remote_sha homebrew)
+    invoke false --push
+    check 'missing companion blocks the package update' nonzero "$RESULT"
+    check 'missing companion cannot publish a mixed-version tap' equal "$(remote_sha homebrew)" "$before"
+    check 'missing companion also blocks the bucket' equal "$(command git --git-dir="$CASE/scoop.git" rev-list --count main)" 1
+    printf 'separately verified daemon\n' > "$CASE/daemon"
+    hash=$(_gh_asset_sha256 "$CASE/daemon")
+    size=$(wc -c < "$CASE/daemon")
+    jq --arg hash "$hash" --argjson size "$size" \
+        '. + [ (.[0] + {name:"tool-daemon",id:26,size:$size,digest:("sha256:"+$hash)}) ]' \
+        "$CASE/assets.json" > "$CASE/complete.json" || return 1
+    cp "$CASE/complete.json" "$CASE/assets.json" || return 1
+    invoke true --skip-scoop
+    check 'preview verifies the companion from its own release asset' json_is "$CASE/output.json" \
+        ".details.assets[\"https://github.com/owner/tool/releases/download/v1.0.0/tool-daemon\"].sha256 == \"$hash\""
+    check 'preview leaves the tap untouched' equal "$(remote_sha homebrew)" "$before"
+    invoke false --skip-scoop --push
+    check 'complete runner and daemon publish successfully' equal "$RESULT" 0
+    published=$(remote_sha homebrew)
+    command git --git-dir="$CASE/homebrew.git" show main:Formula/tool.rb > "$CASE/shipped.rb" || return 1
+    check 'companion URL follows the selected release' grep -Fq 'v1.0.1/tool-daemon"' "$CASE/shipped.rb"
+    check 'companion has its own verified digest' grep -Fq "sha256 \"$hash\"" "$CASE/shipped.rb"
+    check 'resource version follows the application version' equal "$(grep -c 'version "1.0.1"' "$CASE/shipped.rb")" 2
+    check 'external resource stays pinned to its independent release' grep -Fq '/another/tool/releases/download/v7.0.0/helper' "$CASE/shipped.rb"
+    check 'resource installation code is preserved' grep -Fq 'resource("tool-daemon").stage' "$CASE/shipped.rb"
+    invoke false --skip-scoop --push
+    check 'retry revalidates both assets without a new commit' json_is "$CASE/output.json" \
+        ".details.homebrew.status == \"unchanged\" and .details.homebrew.commit == \"$published\" and (.details.assets|length)==2"
+}
+
 case "${FORMULAS_TEST_SCOPE:-all}" in
+    release-companion) formula_companion_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     partial-rows) formula_partial_inventory_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     package-alias) formula_package_alias_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
     scoop-layout) formula_scoop_layout_cases || exit 1; printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"; [[ "$FAIL" -eq 0 ]]; exit $? ;;
@@ -749,6 +806,7 @@ formula_cancellation_cases
 formula_scoop_layout_cases || exit 1
 formula_package_alias_cases || exit 1
 formula_partial_inventory_cases || exit 1
+formula_companion_cases || exit 1
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

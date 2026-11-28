@@ -135,11 +135,11 @@ _formulas_fetch_scoop() {
 # supplies syntax and byte locations, so comments/resources/bottles/install
 # methods cannot be mistaken for the application's download metadata.
 _formulas_homebrew() {
-    local mode="$1" recipe="$2" plan="$3" version="$4"
-    ruby - "$mode" "$recipe" "$plan" "$version" <<'RUBY'
+    local mode="$1" recipe="$2" plan="$3" version="$4" repo="${5:-}"
+    ruby - "$mode" "$recipe" "$plan" "$version" "$repo" <<'RUBY'
 require "json"
 require "ripper"
-mode, path, plan_path, new_version = ARGV
+mode, path, plan_path, new_version, repo = ARGV
 begin
   source = File.binread(path)
   ast = Ripper.sexp(source)
@@ -159,6 +159,7 @@ begin
   edits = []
   downloads = []
   versions = []
+  resources = []
   simple_call = lambda do |node, name|
     node.is_a?(Array) && node[0] == :command && node[1][0] == :@ident && node[1][1] == name
   end
@@ -203,6 +204,13 @@ begin
     (node[0] == :@ident && %w[url sha256 version].include?(node[1])) ||
       node.any? { |child| metadata.call(child) if child.is_a?(Array) }
   end
+  # Select release-owned companion resources by their literal URL prefix.
+  # Independent dependencies can have their own versions and arbitrary DSL.
+  prefix = "https://github.com/#{repo.downcase}/releases/download/"
+  release_resource = lambda do |node|
+    node.is_a?(Array) && ((node[0] == :@tstring_content && node[1].downcase.start_with?(prefix)) ||
+      node.any? { |child| release_resource.call(child) if child.is_a?(Array) })
+  end
   walk = nil
   walk = lambda do |statements|
     return unless statements
@@ -219,12 +227,13 @@ begin
         raise "unpaired application sha256" unless index > 0 && simple_call.call(statements[index - 1], "url")
       elsif node[0] == :method_add_block
         name = block_name.call(node[1])
-        # Ignore resource, bottle, head, livecheck, service and test blocks.
-        if %w[on_macos on_linux on_arm on_intel stable].include?(name)
+        if name == "resource"
+          resources << node[2] if !repo.empty? && release_resource.call(node[2])
+        elsif %w[on_macos on_linux on_arm on_intel stable].include?(name)
           body = node[2]
           raise "unsupported platform block" unless body[0] == :do_block && body[2][0] == :bodystmt && body[2][2..4].all?(&:nil?)
           walk.call(body[2][1])
-        elsif !%w[resource bottle head livecheck service test].include?(name) && metadata.call(node[2])
+        elsif !%w[bottle head livecheck service test].include?(name) && metadata.call(node[2])
           raise "unsupported download block: #{name}"
         end
       elsif [:if, :unless, :elsif].include?(node[0])
@@ -252,6 +261,12 @@ begin
   end
   walk.call(root[1])
   raise "no supported application download URLs" if downloads.empty?
+  resources.each do |body|
+    raise "unsupported companion resource block" unless body[0] == :do_block && body[2][0] == :bodystmt && body[2][2..4].all?(&:nil?)
+    count = downloads.length
+    walk.call(body[2][1])
+    raise "release companion has no verifiable download" if downloads.length == count
+  end
   old_versions = versions.map(&:first).uniq
   raise "conflicting application versions" if old_versions.length > 1
   old_version = old_versions.first
@@ -670,12 +685,12 @@ HELP
             _formulas_operation_error "$status" 1 "Cannot load $manager recipe; no repositories were pushed" "$work"; return $?
         fi
         paths[$manager]="$path"
-        "_formulas_$manager" scan "$recipe" "$work/plan.json" "${tag#v}" > "$work/$manager.scan.json" || status=$?
+        "_formulas_$manager" scan "$recipe" "$work/plan.json" "${tag#v}" "$repo" > "$work/$manager.scan.json" || status=$?
         if ((status == 0)); then
             _formulas_plan_assets "$repo" "$tag" "$release_id" "$work/$manager.scan.json" "$work" || status=$?
         fi
         if ((status == 0)); then
-            "_formulas_$manager" apply "$recipe" "$work/plan.json" "${tag#v}" > "$work/$manager.updated" || status=$?
+            "_formulas_$manager" apply "$recipe" "$work/plan.json" "${tag#v}" "$repo" > "$work/$manager.updated" || status=$?
         fi
         if ((status != 0)); then
             _formulas_operation_error "$status" 1 "Cannot verify/render $manager recipe; no repositories were pushed" "$work"; return $?
