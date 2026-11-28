@@ -1079,6 +1079,7 @@ fi
 mkdir -p "$artifact_dir"
 printf '#!/bin/sh\necho lane-tool\n' > "$artifact_dir/lane-tool"
 chmod 751 "$artifact_dir/lane-tool"
+printf '%s\n' "$artifact_dir/lane-tool" > "$TEST_TMPDIR/raw-worker-path"
 touch -t "${LANE_RAW_MTIME:-202001020304.06}" "$artifact_dir/lane-tool"
 exit 0
 EOF
@@ -1157,29 +1158,38 @@ test_build_raw_archives_preserve_nested_payloads() {
         fi
         harness_setup
         local repo_dir="$TEST_TMPDIR/raw-repo" output_dir="$TEST_TMPDIR/raw-out"
-        local extracted="$TEST_TMPDIR/extracted" archive file problems=()
+        local extracted="$TEST_TMPDIR/extracted" archive file worker_binary="" private_mode public_mode problems=()
         seed_raw_lane_fixture "$repo_dir" "$format"
         exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir"
         archive="$output_dir/lane-tool-1.2.3-linux-amd64.$format"
         [[ "$(exec_status)" -eq 0 ]] || problems+=("exit $(exec_status)")
         mkdir -p "$extracted"
         if [[ "$format" == zip ]]; then
-            unzip -q "$archive" -d "$extracted" 2>/dev/null || problems+=("ZIP extraction failed")
+            (umask 000 && unzip -q "$archive" -d "$extracted") 2>/dev/null || problems+=("ZIP extraction failed")
         else
-            tar -xf "$archive" -C "$extracted" 2>/dev/null || problems+=("tar extraction failed")
+            tar -xpf "$archive" -C "$extracted" 2>/dev/null || problems+=("tar extraction failed")
         fi
+        # Archive members use public 0755/0644 modes. The worker binary and
+        # repository files must retain the fixture's distinct private modes.
         for file in docs/NOTICE legal/NOTICE README.md; do
+            case "$file" in
+                docs/NOTICE) private_mode=745; public_mode=755 ;;
+                legal/NOTICE) private_mode=640; public_mode=644 ;;
+                README.md) private_mode=744; public_mode=755 ;;
+            esac
             cmp -s "$repo_dir/$file" "$extracted/$file" || problems+=("missing or changed $file")
-            [[ "$(lane_file_mode "$repo_dir/$file")" == "$(lane_file_mode "$extracted/$file")" ]] || \
-                problems+=("changed permissions for $file")
+            [[ "$(lane_file_mode "$repo_dir/$file")" == "$private_mode" ]] || problems+=("changed source mode for $file")
+            [[ "$(lane_file_mode "$extracted/$file")" == "$public_mode" ]] || problems+=("wrong published mode for $file")
         done
-        [[ "$(lane_file_mode "$extracted/lane-tool")" == 751 ]] || \
-            problems+=("executable mode was not preserved")
+        read -r worker_binary < "$TEST_TMPDIR/raw-worker-path" || problems+=("missing worker binary path")
+        [[ "$(lane_file_mode "$worker_binary")" == 751 ]] || problems+=("changed source mode for executable")
+        [[ "$(lane_file_mode "$extracted/lane-tool")" == 755 ]] || problems+=("wrong published mode for executable")
+        cmp -s "$worker_binary" "$extracted/lane-tool" || problems+=("changed executable bytes")
         [[ "$("$extracted/lane-tool" 2>/dev/null)" == lane-tool ]] || problems+=("executable payload does not run")
         cmp -s "$archive" "$output_dir/lane-tool-linux-amd64.$format" || \
             problems+=("installer alias differs from the packaged archive")
         if [[ ${#problems[@]} -eq 0 ]]; then
-            pass "raw $format packaging preserves nested companions, modes and executable bytes"
+            pass "raw $format packaging normalizes public modes and preserves private sources and payload bytes"
         else
             fail "raw $format payload: ${problems[*]}"
             echo "stderr: $(exec_stderr | tail -15)"
