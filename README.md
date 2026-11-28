@@ -1616,8 +1616,11 @@ shows the effective boolean, including per-tool files and overrides.
 The watcher rereads this policy before a new launch and before admitting
 pending or failed work. Disabling a tool preserves its pending source identity,
 attempt count, cooldown and build checkpoints, so re-enabling it resumes through
-the same checks. It does not cancel an already running worker. A duplicate
-registry entry cannot override a disabled per-tool repository. Explicit
+the same checks. It does not cancel an already running worker. In a shared
+repository, tools with their own per-tool recipes and distinct release
+workflow files can remain enabled independently. A second name for the
+disabled workflow, a registry-only alias, or a recipe with an ambiguous
+workflow cannot override the opt-out. Explicit
 `dsr check`, `build`, `release` and `fallback` commands remain available for
 manual diagnosis and recovery; `enabled` controls watcher automation.
 

@@ -1433,7 +1433,7 @@ _check_configured_repos() {
     local registry="${DSR_REPOS_FILE:-$config_dir/repos.yaml}"
     local file document registry_tools='{}' registry_entry registry_entries enabled line repo tool name
     local -a files=() records=()
-    local -A seen_tools=() disabled_repos=()
+    local -A seen_tools=()
     for file in "$config_dir"/repos.d/*.yaml; do
         [[ "${file##*/}" != _* ]] || continue
         [[ -e "$file" || -L "$file" ]] || continue
@@ -1462,6 +1462,9 @@ _check_configured_repos() {
             {tool: (.tool_name // .name // ""), name: (.tool_name // .name // $name),
              repo: (.repo // .github.repo // ""), workflow: (.workflow // .github.workflow // ""),
              default_workflow: (.workflow == null and .github.workflow == null),
+             watch_route: ((if .workflow == null then ".github/workflows/release.yml" else .workflow end) |
+                 if type == "string" and test("\\A\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml\\z")
+                 then . else null end),
              local_path: (.local_path // .local.path // ""), language: (.language // .local.language // ""),
              targets: (.targets // .build.targets // []), enabled: $enabled}' <<< "$document") || return 4
         repo=$(jq -er '.repo | strings' <<< "$line") || return 4
@@ -1470,7 +1473,6 @@ _check_configured_repos() {
         seen_tools["$name"]=1
         [[ -z "$tool" ]] || seen_tools["$tool"]=1
         [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
-        [[ "$enabled" != false ]] || disabled_repos["${repo,,}"]=1
         records+=("$line")
     done
     registry_entries=$(jq -c 'to_entries[]' <<< "$registry_tools") || return 4
@@ -1493,18 +1495,15 @@ _check_configured_repos() {
         seen_tools["$tool"]=1
         records+=("$line")
     done <<< "$registry_entries"
-    # Keep distinct tool names visible in list output. A per-tool opt-out is
-    # authoritative for its repository even when another registry key points
-    # there; such aliases remain visible, but cannot authorize automation.
-    local -a admitted=()
-    for line in ${records[@]+"${records[@]}"}; do
-        repo=$(jq -r '.repo' <<< "$line") || return 4
-        if [[ -n "${disabled_repos[${repo,,}]:-}" ]]; then
-            line=$(jq -c '.enabled = false' <<< "$line") || return 4
-        fi
-        admitted+=("$line")
-    done
-    printf '%s\n' ${admitted[@]+"${admitted[@]}"}
+    # Only independently configured release workflows can remain active
+    # alongside an opt-out. Registry aliases have no build authority, and an
+    # ambiguous per-tool route cannot prove that it selects a different run.
+    printf '%s\n' ${records[@]+"${records[@]}"} | jq -sc '
+        (reduce (.[] | select(has("watch_route") and .enabled == false)) as $r
+            ({}; .[$r.repo | ascii_downcase] += [$r.watch_route])) as $disabled |
+        .[] | . as $r | ($disabled[$r.repo | ascii_downcase] // []) as $routes |
+        if any($routes[]; . == null or $r.watch_route == null or . == $r.watch_route)
+        then .enabled = false else . end | del(.watch_route)' || return 4
 }
 
 # Withdraw the complete poll after a selector or output parser fails. Raw jq

@@ -4543,6 +4543,24 @@ _shared_workflow_fixture() {
     assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
 }
 
+@test "shared repository watcher keeps an independent workflow enabled when a sibling opts out" {
+    _shared_workflow_fixture
+    yq -i '.enabled = false' "$DSR_CONFIG_DIR/repos.d/ntm.yaml"
+    printf 'tool_name: sibling-alias\nrepo: Dicklesworthstone/ntm\nworkflow: .github/workflows/release.yml\n' \
+        > "$DSR_CONFIG_DIR/repos.d/sibling-alias.yaml"
+    run _routing_dsr --json repos list
+    assert_equal 0 "$status"
+    jq -e '(.details.repos | map({key:.name,value:.enabled}) | from_entries) |
+        .worker == true and .ntm == false and .["sibling-alias"] == false and .["alias-worker"] == false' <<< "$output"
+
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 12345
+    jq -e '.attempts["12345"] | .tool == "worker" and
+        .watch_admission.workflow_path == ".github/workflows/worker.yml"' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
 @test "dsr check --all checks every workflow" {
     harness_create_config
     _setup_repos_d
