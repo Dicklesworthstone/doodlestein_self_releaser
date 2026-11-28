@@ -1465,6 +1465,7 @@ _check_configured_repos() {
              watch_route: ((if .workflow == null then ".github/workflows/release.yml" else .workflow end) |
                  if type == "string" and test("\\A\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml\\z")
                  then . else null end),
+             watch_event: (if has("workflow_event") then .workflow_event else "push" end),
              local_path: (.local_path // .local.path // ""), language: (.language // .local.language // ""),
              targets: (.targets // .build.targets // []), enabled: $enabled}' <<< "$document") || return 4
         repo=$(jq -er '.repo | strings' <<< "$line") || return 4
@@ -1501,9 +1502,21 @@ _check_configured_repos() {
     printf '%s\n' ${records[@]+"${records[@]}"} | jq -sc '
         (reduce (.[] | select(has("watch_route") and .enabled == false)) as $r
             ({}; .[$r.repo | ascii_downcase] += [$r.watch_route])) as $disabled |
+        # A single workflow file may handle several GitHub events for
+        # different release recipes. Only an event with one owner can launch.
+        ([.[] | select(.watch_route != null)] | group_by([(.repo | ascii_downcase),.watch_route]) |
+         reduce (.[] | select(length > 1)) as $group ({};
+            .[$group[0].repo | ascii_downcase][$group[0].watch_route] = {
+                path:$group[0].watch_route, owners:($group | group_by(.watch_event) |
+                    map(select(length == 1) | .[0] |
+                        select((.watch_event | IN("push","release","workflow_dispatch")) and .tool != "") |
+                        {key:.watch_event,value:.tool}) | from_entries)})) as $shared |
         .[] | . as $r | ($disabled[$r.repo | ascii_downcase] // []) as $routes |
         if any($routes[]; . == null or $r.watch_route == null or . == $r.watch_route)
-        then .enabled = false else . end | del(.watch_route)' || return 4
+        then .enabled = false else . end |
+        ($shared[$r.repo | ascii_downcase][$r.watch_route // ""]) as $route |
+        if $route == null then . else .shared_workflow = $route end |
+        del(.watch_route,.watch_event)' || return 4
 }
 
 # Withdraw the complete poll after a selector or output parser fails. Raw jq
@@ -1716,7 +1729,7 @@ EOF
         if length == 0 then $first
         elif $all then
             if length == 1 then first(.[])
-            else $first + {tool:null, workflow_tools:map_values(.tool)} end
+            else $first + {tool:null, workflow_tools:map_values(.shared_workflow // .tool)} end
         else .[] end') || {
         _check_abort_observation "$?" 4 "$threshold" "Could not plan repository workflow checks"
         return $?
@@ -1779,13 +1792,18 @@ EOF
         local projection_status=0
         result=$(jq -c --arg tool "$tool" --slurpfile target /dev/fd/3 '
             . + {tool: (if $tool == "" then null else $tool end)} |
-            if $target[0].workflow_tools == null then .
+            if $target[0].workflow_tools == null and $target[0].shared_workflow == null then .
             else
                 def owner:
                     ((.path // "") | split("@")[0] // "") as $path |
-                    if ($path | startswith(".github/workflows/")) then
+                    (if $target[0].workflow_tools == null then $target[0].shared_workflow
+                     elif ($path | startswith(".github/workflows/")) then
                         $target[0].workflow_tools[$path | ltrimstr(".github/workflows/")]
+                     else null end) as $route |
+                    if ($route | type) != "object" then $route
+                    elif $route.path == $path then $route.owners[.event // ""]
                     else null end;
+                .tool = null |
                 (.queued_runs[]?, .stuck_runs[]?) |= (. + {tool:owner})
             end' 3<<< "$line" <<< "$result" 2>/dev/null) || projection_status=$?
         if ((projection_status != 0)); then
@@ -2765,6 +2783,11 @@ _watch_configured_repo_matches() {
     fi
     if ! jq -e '.enabled == true' <<< "$configured" >/dev/null; then
         log_warn "Automatic fallback disabled for $tool (run $run_id); retaining existing recovery history"
+        return 1
+    fi
+    if ! jq -e --arg tool "$tool" '.shared_workflow == null or
+        any(.shared_workflow.owners[]; . == $tool)' <<< "$configured" >/dev/null; then
+        log_warn "Run $run_id no longer has a unique workflow event for $tool; automatic fallback withheld"
         return 1
     fi
     observed_file=$(_watch_workflow_file "$workflow_path") || {

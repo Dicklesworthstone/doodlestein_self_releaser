@@ -1658,7 +1658,13 @@ cmd_build() {
         '{tool:"ntm",version:"v1.2.3",status:"success",build_purpose:"release",publishable:true,
           run_id:"11111111-1111-4111-8111-111111111111",source:{git_sha:$source,git_ref:"v1.2.3"},
           summary:{total:1,success:1,failed:0},artifacts:[{name:"ntm",sha256:$sha,size_bytes:$size}]}' \
-        > "$out/ntm-v1.2.3-manifest.json"
+        > "$out/ntm-v1.2.3-manifest.json" || return 4
+    local manifest=ntm-v1.2.3-manifest.json digest
+    digest=$(_release_sha256 "$out/$manifest") || return 4
+    jq -ce --arg name "$manifest" --arg digest "$digest" '
+        {publication_schema:1,publication_status:"completed",build_purpose:"release",publishable:true,
+         run_id:.run_id,git_sha:.source.git_sha,manifest_name:$name,manifest_sha256:$digest}
+    ' "$out/$manifest" > "$out/.dsr-build-purpose.json"
 }
 cmd_release() {
     printf 'published\n' >> "$TEST_TMPDIR/release.calls" || return 4
@@ -2275,7 +2281,7 @@ PY
     harness_create_config
     _setup_repos_yaml
     _watch_configure_ntm 'enabled: false'
-    yq -i '.tools.ntm.enabled = true' "$DSR_REPOS_FILE"
+    yq -i '.tools.ntm.enabled = true | .tools.ntm.workflow = ".github/workflows/release.yml"' "$DSR_REPOS_FILE"
     local root="${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}"
     run bash -c 'source "$1/src/config.sh"; config_registry_divergence_json ntm' _ "$root"
     assert_equal 0 "$status"
@@ -4558,6 +4564,39 @@ _shared_workflow_fixture() {
     _watch_completed 12345
     jq -e '.attempts["12345"] | .tool == "worker" and
         .watch_admission.workflow_path == ".github/workflows/worker.yml"' "$DSR_STATE_DIR/triggered.json"
+    assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
+}
+
+@test "shared workflow events select the right recipe and withhold ambiguous automation" {
+    _shared_workflow_fixture
+    yq -i '.workflow = ".github/workflows/release.yml" | .workflow_event = "release"' \
+        "$DSR_CONFIG_DIR/repos.d/worker.yaml"
+    local history
+    history=$(_queued_release_run | jq '.workflow_runs[0].event = "release" |
+        .workflow_runs += [(.workflow_runs[0] + {id:67890,event:"push"}),
+                           (.workflow_runs[0] + {id:67891,event:"workflow_dispatch"})]')
+    _mock_gh_runs "$history" true
+    local opt
+    for opt in '' --all; do
+        run _routing_dsr --json check ${opt:+"$opt"}
+        assert_equal 1 "$status"
+        jq -e '(.details.throttled | sort_by(.run_id) | map([.tool,.run_id])) ==
+            [["worker",12345],["ntm",67890],[null,67891]]' <<< "$output"
+    done
+
+    # A third recipe introduces competing publication authority for push.
+    # A stale observation naming ntm must stop at the admission recheck too.
+    printf 'tool_name: other\nrepo: Dicklesworthstone/ntm\nworkflow: .github/workflows/release.yml\n' \
+        > "$DSR_CONFIG_DIR/repos.d/other.yaml"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal 0 "$status"
+    [[ ! -e "$TEST_TMPDIR/fallback.starts" ]]
+    DSR_WATCH_FIXTURE_REAL_CHECK=1 run _routing_watch '{}' --auto-fallback
+    assert_equal 0 "$status"
+    _watch_completed 12345
+    jq -e '.attempts | keys == ["12345"] and
+        (.["12345"] | .tool == "worker" and .watch_admission.workflow_event.event == "release")' \
+        "$DSR_STATE_DIR/triggered.json"
     assert_equal 1 "$(wc -l < "$TEST_TMPDIR/fallback.starts" | tr -d ' ')"
 }
 

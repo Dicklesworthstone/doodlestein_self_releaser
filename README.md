@@ -1591,6 +1591,12 @@ the repo's configured tool at the run's version tag; repos with no dsr tool
 are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
 fallbacks would start.
 
+When several tools in a repository share a release workflow file, set
+`workflow_event` in each tool's recipe to its GitHub trigger (`push` by
+default, `release`, or `workflow_dispatch`). The observed file and event
+must identify one recipe. Runs with competing or unconfigured events appear
+in `dsr check` without a tool and the watcher withholds their fallback.
+
 Use `--confirm-polls N` (1–32, default 1) to wait for the same upstream
 workflow attempt, source commit and queue threshold to appear stalled in N
 consecutive polls before reporting it, notifying, or scheduling a fallback.
