@@ -5473,12 +5473,13 @@ EOF
     # selection: documentation.tar.gz cannot become the installer archive.
     # Stream the receipt map; large release inventories must not enter argv.
     _build_primary_manifest_artifacts() {
-        local manifest_file="$1" additional_receipts="${verified_additional_receipts:-}"
+        local manifest_file="$1" additional_receipts="${verified_additional_receipts:-}" metadata
         [[ -n "$additional_receipts" ]] || additional_receipts='{}'
-        jq -c --slurpfile manifest "$manifest_file" '
+        metadata=$(_act_manifest_metadata_name_pattern) && [[ -n "$metadata" ]] || return 4
+        jq -c --slurpfile manifest "$manifest_file" --arg metadata "$metadata" '
             [.[] | {name, target}] as $additional |
             $manifest[0].artifacts | map(select(. as $artifact |
-                all($additional[];
+                .role != "additional" and (.name | ascii_downcase | test($metadata) | not) and all($additional[];
                     .name != $artifact.name or .target != $artifact.target)))
         ' <<< "$additional_receipts"
     }
@@ -6153,20 +6154,25 @@ EOF
         binary_name=$(config_get_tool_field "$tool" "binary_name" "" 2>/dev/null || echo "")
         [[ -z "$binary_name" ]] && binary_name="$tool"
 
+        # One workflow job can build releases for several operating systems.
+        # The manifest already resolved their actual platforms; the job's
+        # scheduling target alone cannot choose their archive formats or names.
+        local primary_artifacts='[]' target target_rows
+        if [[ -f "$manifest_file" ]]; then
+            primary_artifacts=$(_build_primary_manifest_artifacts "$manifest_file") || return 4
+        fi
+        target_rows=$(jq -r --slurpfile primaries /dev/fd/3 '
+            [.targets[]? | select(.status == "success" or .status == "ok" or .status == "passed") | .platform // empty] as $ok |
+            (if ($ok|length) > 0 then $ok else [.targets[]? | .platform // empty] end) +
+            [$primaries[0][] | .target | strings | select(length > 0)] | unique[]
+        ' 3<<< "$primary_artifacts" <<< "$result_json") || return 4
         local -a targets=()
         while IFS= read -r target; do
             [[ -n "$target" ]] && targets+=("$target")
-        done < <(echo "$result_json" | jq -r '[.targets[]? | select(.status == "success" or .status == "ok" or .status == "passed") | .platform // empty] | unique[]' 2>/dev/null)
-
-        if [[ ${#targets[@]} -eq 0 ]]; then
-            while IFS= read -r target; do
-                [[ -n "$target" ]] && targets+=("$target")
-            done < <(echo "$result_json" | jq -r '[.targets[]? | .platform // empty] | unique[]' 2>/dev/null)
-        fi
+        done <<< "$target_rows"
 
         if [[ ${#targets[@]} -eq 0 ]]; then
             if [[ -n "$target_list" ]]; then
-                local target
                 for target in $target_list; do
                     [[ -n "$target" ]] && targets+=("$target")
                 done

@@ -1654,6 +1654,79 @@ test_build_names_workflow_archives() {
     done
 }
 
+test_build_packages_cross_platform_workflow_outputs() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != true ]]; then skip "yq required for cross-platform packaging"; return 0; fi
+    harness_setup
+    local repo="$TEST_TMPDIR/repo" out="$TEST_TMPDIR/out" inputs="$TEST_TMPDIR/source-assets"
+    local manifest="$out/lane-tool-v1.2.3-manifest.json" platform triple format name member label digest problems=()
+    seed_lane_archive_fixture "$repo"
+    yq -i '.artifact_naming="${name}-${version}-${target_triple}" |
+        .install_script_compat="${name}-${target_triple}" |
+        .archive_format={"linux":"tar.gz","darwin":"tar.gz","windows":"zip"} |
+        .include_files=["LICENSE"]' "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" || return 1
+    mkdir -p "$inputs"
+    while read -r platform triple member; do
+        printf 'executable for %s\n' "$platform" > "$inputs/$member"
+        chmod 755 "$inputs/$member"
+        tar -czf "$inputs/worker-$triple.tar.gz" -C "$inputs" "$member" || return 1
+    done <<'TARGETS'
+linux/amd64 x86_64-unknown-linux-gnu lane-tool
+darwin/arm64 aarch64-apple-darwin lane-tool
+windows/amd64 x86_64-pc-windows-msvc lane-tool.exe
+TARGETS
+    mock_command_script act "$(cat <<'EOF'
+if [[ "${1:-}" == "--version" ]]; then echo 'act version 0.2.87'; exit 0; fi
+prev=""
+for arg in "$@"; do
+    if [[ "$prev" == "--artifact-server-path" ]]; then
+        mkdir -p "$arg" || exit 1
+        cp "$CROSS_INPUT"/worker-*.tar.gz "$arg/" || exit 1
+        printf '{}\n' > "$arg/worker-freebsd-amd64.spdx.json"
+        break
+    fi
+    prev="$arg"
+done
+EOF
+)"
+    CROSS_INPUT="$inputs" exec_run run_lane_build lane-tool --version 1.2.3 --target linux/amd64 --output-dir "$out"
+    [[ "$(exec_status)" == 0 ]] || problems+=("build returned $(exec_status)")
+    while read -r platform triple member format; do
+        for label in "lane-tool-1.2.3" "lane-tool"; do
+            name="$label-$triple.$format"
+            if [[ "$format" == zip ]]; then
+                [[ "$(unzip -p "$out/$name" "$member" 2>/dev/null)" == "executable for $platform" ]] || problems+=("$name payload")
+                unzip -p "$out/$name" LICENSE 2>/dev/null | cmp -s - "$repo/LICENSE" || problems+=("$name LICENSE")
+            else
+                [[ "$(tar -xOzf "$out/$name" "$member" 2>/dev/null)" == "executable for $platform" ]] || problems+=("$name payload")
+                tar -xOzf "$out/$name" LICENSE 2>/dev/null | cmp -s - "$repo/LICENSE" || problems+=("$name LICENSE")
+            fi
+            digest=$(sha256sum "$out/$name" 2>/dev/null | cut -d' ' -f1)
+            jq -e --arg n "$name" --arg p "$platform" --arg t "$triple" --arg sha "$digest" \
+                'any(.artifacts[];.name==$n and .target==$p and .target_triple==$t and .sha256==$sha)' \
+                "$manifest" >/dev/null 2>&1 || problems+=("$name receipt")
+        done
+    done <<'TARGETS'
+linux/amd64 x86_64-unknown-linux-gnu lane-tool tar.gz
+darwin/arm64 aarch64-apple-darwin lane-tool tar.gz
+windows/amd64 x86_64-pc-windows-msvc lane-tool.exe zip
+TARGETS
+    jq -e '.requested_targets==["linux/amd64"] and
+        any(.artifacts[]; .name=="worker-freebsd-amd64.spdx.json") and
+        all(.artifacts[]|select(.target=="freebsd/amd64"); .name=="worker-freebsd-amd64.spdx.json")' \
+        "$manifest" >/dev/null 2>&1 || problems+=("metadata-only platform or invented build target")
+    # Packaging failure in a different OS must hold the complete release,
+    # even though the scheduled Linux job and its own payload succeeded.
+    out="$TEST_TMPDIR/corrupt-out"
+    printf 'interrupted upload\n' > "$inputs/worker-x86_64-pc-windows-msvc.tar.gz"
+    CROSS_INPUT="$inputs" exec_run run_lane_build lane-tool --version 1.2.3 --target linux/amd64 --output-dir "$out"
+    [[ "$(exec_status)" == 1 ]] || problems+=("corrupt Windows archive did not fail collection")
+    lane_publication_matches "$out" "$out/lane-tool-v1.2.3-manifest.json" false || problems+=("corrupt cross-platform output publishable")
+    if [[ ${#problems[@]} == 0 ]]; then pass "one workflow job packages each produced platform";
+    else fail "cross-platform workflow: ${problems[*]}"; echo "stderr: $(exec_stderr | tail -12)"; fi
+    harness_teardown
+}
+
 test_build_refuses_unproduced_target_triple_variant() {
     ((TESTS_RUN++))
     if [[ "$HAS_YQ" != "true" ]]; then
@@ -2365,6 +2438,11 @@ PY
     harness_teardown
 }
 
+if [[ "${1:-}" == --cross-platform-workflow-only ]]; then
+    test_build_packages_cross_platform_workflow_outputs
+    [[ "$TESTS_FAILED" == 0 && "$TESTS_SKIPPED" == 0 ]]
+    exit $?
+fi
 if [[ "${1:-}" == --prebuilt-naming-only ]]; then
     test_build_names_workflow_archives
     printf '\nWorkflow naming: %s passed, %s failed, %s skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
@@ -2456,6 +2534,7 @@ test_build_completes_lane_archive_with_include_files
 test_build_refuses_attested_thin_lane_archive
 test_build_checks_prebuilt_include_contract
 test_build_names_workflow_archives
+test_build_packages_cross_platform_workflow_outputs
 test_build_validates_prebuilt_archives_without_includes
 test_build_workflow_zip_admission
 test_build_packages_each_target_triple_variant

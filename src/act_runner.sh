@@ -21360,15 +21360,23 @@ _act_validate_native_matrix_result_inventory() {
     fi
 }
 
+# Shared by manifest admission and packaging so a detached signature, checksum
+# or SBOM cannot cause the builder to manufacture a primary for a platform.
+_act_manifest_metadata_name_pattern() {
+    printf '%s\n' '\.(minisig|sig|asc|md5|sha256|sha512|intoto\.jsonl|spdx(\.json)?|cdx\.(json|xml))$|^(sha(256|512)sums|checksums)(\.txt)?$|\.sbom\.|-manifest\.json$'
+}
+
 # Ordinary workflow jobs can emit several compiler variants under one platform
 # receipt. Success of that job is not evidence that every configured primary
 # exists. Check the final payload inventory independently of execution method;
 # optional aliases and configured companion assets do not define coverage.
 _act_validate_manifest_variant_coverage() {
     local tool="$1" manifest="$2"
-    local companions inventory platforms platform configured missing mapping
+    local companions inventory platforms platform configured missing mapping metadata
     companions=$(config_get_additional_artifacts_json "$tool") || return 4
-    if ! inventory=$(jq -ces --slurpfile companion_documents /dev/fd/3 '
+    metadata=$(_act_manifest_metadata_name_pattern) && [[ -n "$metadata" ]] || return 4
+    if ! inventory=$(jq -ces --slurpfile companion_documents /dev/fd/3 \
+        --arg metadata "$metadata" '
         if length != 1 or (.[0] | type != "object") or
            ($companion_documents | length != 1 or (.[0] | type != "object"))
         then error("expected one manifest and companion map")
@@ -21391,8 +21399,7 @@ _act_validate_manifest_variant_coverage() {
                     (.name // .filename) as $name |
                     select(.role != "additional" and
                         ($additional_names | index($name)) == null and
-                        ($name | ascii_downcase |
-                            test("\\.(minisig|sig|asc|md5|sha256|sha512|intoto\\.jsonl|spdx(\\.json)?|cdx\\.(json|xml))$|^(sha(256|512)sums|checksums)(\\.txt)?$|\\.sbom\\.|-manifest\\.json$") | not)) |
+                        ($name | ascii_downcase | test($metadata) | not)) |
                     {target, target_triple}]
             } end
         end
