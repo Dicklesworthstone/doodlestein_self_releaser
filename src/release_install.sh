@@ -201,6 +201,10 @@ def data_directories(files):
     return children
 
 
+def runtime_target_matches(item, asset_target, platform_target):
+    return asset_target == platform_target or (asset_target == "additional" and item["path"].startswith("share/"))
+
+
 def recipe(value, contract=None):
     fields = {"schema_version", "target", "executables"}
     need(isinstance(value, dict) and fields <= set(value) <= fields | {"target_triple", "files"} and
@@ -220,7 +224,7 @@ def recipe(value, contract=None):
         destinations = {}
         for item in value["files"]:
             need(isinstance(item, dict) and {"path", "artifact"} <= set(item) <= {"path", "artifact", "member"} and
-                 member(item["path"]) and item["path"].startswith("share/") and name(item["artifact"]) and
+                 member(item["path"]) and item["path"].startswith(("share/", "lib/")) and name(item["artifact"]) and
                  ("member" not in item or member(item["member"])), "invalid runtime file selection", 4)
             parts = item["path"].split("/")
             for i in range(1, len(parts) + 1):
@@ -253,7 +257,7 @@ def recipe(value, contract=None):
                  "recipe compiler differs from the independent asset contract", 4)
         for item in value.get("files", []):
             asset = assets.get(item["artifact"])
-            need(asset is not None and asset["target"] in (value["target"], "additional") and
+            need(asset is not None and runtime_target_matches(item, asset["target"], value["target"]) and
                  ((asset["archive_format"] in ("binary", "none")) == ("member" not in item)),
                  "recipe runtime file differs from the independent asset contract", 4)
             need(asset["target"] == "additional" or "target_triple" not in value or "target_triple" not in asset or
@@ -328,8 +332,7 @@ def verify_generation(directory, expected):
     plain(directory, "dir")
     files = expected.get("files", [])
     namespace = {"bin", "receipt.json", "release.intoto.jsonl", "release.intoto.jsonl.minisig"}
-    if files:
-        namespace.add("share")
+    namespace.update(item["path"].split("/", 1)[0] for item in files)
     need({p.name for p in directory.iterdir()} == namespace,
          "generation namespace changed")
     retained_receipt = plain(directory / "receipt.json", "file")
@@ -546,8 +549,8 @@ try:
                  "raw artifacts forbid member; archives require member", 4)
         for item in selected.get("files", []):
             record = records.get(item["artifact"])
-            need(record is not None and record["target"] in (selected["target"], "additional"),
-                 "runtime file artifact is not a signed payload for this target or the shared release", 4)
+            need(record is not None and runtime_target_matches(item, record["target"], selected["target"]),
+                 "runtime file has no signed payload for its destination and target: " + item["path"], 4)
             if record["target"] == "additional":
                 need("target_triple" not in record, "shared runtime file has a compiler identity", 4)
             elif "target_triple" in selected:
@@ -597,8 +600,8 @@ try:
             if "member" in item:
                 source /= item["member"]
             plain(source, "file")
-            # Unlike executables, an explicitly selected empty archive member
-            # is useful data. The containing archive is still authenticated.
+            if item["path"].startswith("lib/"):
+                need(source.stat().st_size > 0, "empty runtime library: " + item["path"])
             pin = digest(source)
             dest = staged / item["path"]
             copy_pinned(source, dest, pin, 0o644)
@@ -631,8 +634,10 @@ try:
                       executables=installed, snapshot_sha256=verified["snapshot_sha256"],
                       dry_run=args.dry_run)
         if installed_files:
-            result.update(files=installed_files, share_dir=str(prefix / "current/share"),
-                          generation_share_dir=str(prefix / "generations" / identity / "share"))
+            result["files"] = installed_files
+            for directory in sorted({item["path"].split("/", 1)[0] for item in installed_files}):
+                result[directory + "_dir"] = str(prefix / "current" / directory)
+                result["generation_" + directory + "_dir"] = str(prefix / "generations" / identity / directory)
         if "target_triple" in selected:
             result["target_triple"] = selected["target_triple"]
         if contract is not None:

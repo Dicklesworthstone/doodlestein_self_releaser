@@ -195,36 +195,43 @@ runtime files can add an explicit `files` list to the same recipe:
   ],
   "files": [
     {"path": "share/demo/runtime.json", "artifact": "runtime.json"},
+    {"path": "lib/libdemo.so.1", "artifact": "demo-linux.tar.gz", "member": "lib/libdemo.so.1"},
     {"path": "share/demo/docs/help.txt", "artifact": "demo-linux.tar.gz", "member": "docs/help.txt"}
   ]
 }
 ```
 
 Each `path` is a destination relative to the generation root and must begin
-with exactly `share/`. The same safe components and 1024-character limit used
+with `share/` for runtime data or `lib/` for application-private libraries. The same safe components and 1024-character limit used
 for archive members apply. There are at most 256 file selections. Duplicate
 destinations, case aliases in any path component, file/directory prefix
-collisions, traversal and unknown fields are rejected before acquisition. There
-is no wildcard, directory-copy, destination outside `share/`, or mode override.
+collisions, traversal and unknown fields are rejected before acquisition.
 An absent or empty `files` list preserves the executable-only recipe and
 generation identity; a null list is invalid.
 
-An exact signed payload may supply a raw data file, or a safe archive `member`
-may supply it. Its signed target must be either the recipe's physical platform
-or `additional`, the release-wide shared asset namespace. A shared asset cannot
-supply an executable or satisfy the platform matrix. When the recipe has an
+An exact signed payload or archive member can supply a file. Libraries must
+come from the selected platform. Files under `share/` can also come from
+`additional`, the release-wide shared asset namespace. When the recipe has an
 explicit `target_triple`, platform-owned data must have that same signed
 compiler identity. Shared data remains independent of the compiler variant and
 must have no `target_triple`. An independently supplied release contract is also
 checked against these selections before network acquisition.
 
-Data files always receive mode **0644**, even when an archive marks the member
-executable. Their required directories receive mode **0755**. Empty archive
-members are valid data; executable members must remain nonempty, and existing
+Data files and libraries receive mode **0644**, even when an archive marks the member
+executable. Their required directories receive mode **0755**. Only data under
+`share/` may select an empty archive member. Existing
 whole-snapshot subject admission still applies to raw assets. An archive used
 by both executable and data selections is authenticated and extracted once.
 No file is inferred from its extension or copied merely because it is present
 beside a selected binary.
+
+For an ELF binary linked with a runpath of `$ORIGIN/../lib`, install each
+required library under the exact filename the loader requests, such as
+`lib/libdemo.so.1`. Select the regular file containing its bytes when the
+input layout uses a versioned filename. Existing archive admission rules
+continue to reject symlink entries. On macOS the corresponding application
+can use `@executable_path/../lib`. Each library selection binds the signed
+artifact and bytes. Loader compatibility remains the publisher's responsibility.
 
 The application must know how to locate its data under the generation's
 `share/` tree. The installer does not inject environment variables or rewrite
@@ -273,8 +280,9 @@ export PATH="/home/alice/.local/demo/current/bin:$PATH"
 
 The installer never creates or replaces unrelated files in `~/.local/bin`.
 For a recipe with runtime files, the result also includes their selected paths,
-signed ownership, hashes, sizes and modes in `files`, plus `share_dir` (the active
-path) and `generation_share_dir` (the immutable-version path).
+signed ownership, hashes, sizes and modes in `files`. Each selected directory
+has an active and a generation-specific path (`share_dir`, `generation_share_dir`,
+`lib_dir`, `generation_lib_dir`).
 Its managed prefix looks like:
 
 ```text
@@ -285,7 +293,9 @@ demo/
   generations/
     GENERATION_SHA256/
       bin/                           # Exactly the selected executable names
-      share/                         # Only when runtime files are selected
+      lib/                           # Only when private libraries are selected
+        libdemo.so.1
+      share/                         # Only when shared data is selected
         demo/runtime.json            # Explicit destination, fixed mode 0644
         demo/docs/help.txt
       receipt.json                   # Recipe, signer, source and installed hashes
@@ -314,7 +324,7 @@ failure. Old generations are retained and are never pruned automatically.
 
 Repeating the identical command reauthenticates the snapshot, reconstructs the
 expected generation and verifies its retained binaries, data and proofs. The
-complete `share/` file and directory namespace must match: missing or extra
+complete `share/` and `lib/` file and directory namespaces must match: missing or extra
 files, undeclared empty directories, links, changed bytes and changed modes are
 refused before reuse or activation. It reuses an
 identical generation without changing its file or pointer identities. Changed

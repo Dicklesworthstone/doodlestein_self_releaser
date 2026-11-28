@@ -133,7 +133,7 @@ def sign(proof):
                         "-t", "dsr installer variant test"], check=True, capture_output=True, timeout=30)
 
 
-def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False, workflow=False, legacy=False):
+def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False, workflow=False, legacy=False, libraries=False):
     base = work / label
     base.mkdir()
     snapshot = base / "snapshot"
@@ -149,6 +149,21 @@ def make_snapshot(label, variants=(gnu, musl), explicit=True, with_data=False, w
             (payload / binary).write_text("#!/bin/sh\nprintf '%s\\n' 'TEST " + triple + " " + binary + "'\nexit 93\n")
             (payload / binary).chmod(0o755)
         members = ["app", "helper"]
+        if libraries and index == 0:
+            # Both versions have the same SONAME and a distinct observable ABI
+            # result. The loader must resolve it relative to the installed app.
+            soname = "libdsr_install_test.so.1"
+            for version in (1, 2):
+                path = "libs/rev%d/%s" % (version, soname)
+                (payload / path).parent.mkdir(parents=True)
+                subprocess.run(["cc", "-shared", "-fPIC", "-Wl,-soname," + soname, "-x", "c", "-",
+                                "-o", str(payload / path)], input="int answer(void){return %d;}" % version,
+                               text=True, check=True)
+                members.append(path)
+            subprocess.run(["cc", "-x", "c", "-", "-x", "none", str(payload / members[-1]),
+                            "-Wl,-rpath,$ORIGIN/../lib", "-o", str(payload / "app")],
+                           input='#include <stdio.h>\nextern int answer(void);\nint main(void){printf("%d\\n",answer());}',
+                           text=True, check=True)
         if with_data:
             (payload / "docs").mkdir()
             (payload / "docs/help.txt").write_text("Owned documentation for " + triple + "\n")
@@ -482,6 +497,77 @@ def runtime_data_cases():
     check("failed data preparations leave no private installation staging", not list(work.glob(".dsr-install-*")))
 
 
+def runtime_library_cases():
+    soname = "libdsr_install_test.so.1"
+    archive = "payload-0.tar.gz"
+    matrix = [target, "windows/arm64"]
+    snapshot, producer = make_snapshot("shared-libraries", with_data=True, libraries=True)
+    selected = dict(schema_version=1, target=target, target_triple=gnu,
+                    executables=[dict(name="app", artifact=archive, member="app")],
+                    files=[dict(path="lib/" + soname, artifact=archive, member="libs/rev1/" + soname)])
+    first, prefix = install("libraries", snapshot, selected, policy_targets=matrix)
+    if first.get("status") != "installed":
+        return
+    def execute():
+        clean = {k: v for k, v in env.items() if not k.startswith("LD_")}
+        return subprocess.check_output([prefix / "current/bin/app"], env=clean, cwd=work, text=True).strip()
+
+    library = prefix / "current/lib" / soname
+    check("installed application loads its selected private shared library", execute() == "1" and
+          library.stat().st_mode & 0o777 == 0o644 and digest(library) == first["files"][0]["sha256"] and
+          first["lib_dir"] == str(library.parent) and "share_dir" not in first and
+          first["generation_lib_dir"] == str(prefix / "generations" / first["generation"] / "lib"))
+    replacement = copy.deepcopy(selected)
+    replacement["files"][0]["member"] = "libs/rev2/" + soname
+    replacement["files"].append(dict(path="share/app/info.json", artifact="runtime.json"))
+    changed, _ = install("library-upgrade", snapshot, replacement, prefix, extra=("--replace",), policy_targets=matrix)
+    check("one activation switches code, libraries and data", execute() == "2" and
+          changed.get("previous_generation") == first["generation"] and
+          Path(changed["share_dir"], "app/info.json").is_file())
+    before = data_state(prefix)
+    for label, fields, status in (
+        ("release-wide", dict(artifact="runtime.json"), 4),
+        ("foreign", dict(artifact="foreign.json"), 4),
+        ("wrong-abi", dict(artifact="model-1.json"), 4),
+        ("empty", dict(artifact=archive, member="docs/EMPTY"), 7),
+        ("absent", dict(artifact=archive, member="missing.so"), 7),
+    ):
+        bad = dict(selected, files=[dict(path="lib/" + soname, **fields)])
+        install("library-" + label, snapshot, bad, prefix, status, ("--replace",), matrix)
+        check(label + " library cannot replace the active generation", data_state(prefix) == before and execute() == "2")
+
+    manifest = load(producer)
+    contract = dict(schema_version=1, required_variants=manifest["required_variants"],
+                    required_assets=[{k: a[k] for k in ("name", "target", "target_triple", "archive_format") if k in a}
+                                     for a in manifest["artifacts"]])
+    contract_file = save(work / "libraries-contract.json", contract)
+    preview, _ = install("library-contract", snapshot, selected, prefix,
+                         extra=("--dry-run", "--release-contract", contract_file), policy_targets=matrix)
+    check("independent content contract admits the exact compiler-bound library",
+          preview.get("status") == "planned" and data_state(prefix) == before)
+    bad = dict(selected, files=[dict(path="lib/" + soname, artifact="runtime.json")])
+    invoke(["bash", runtime / "release_install.sh", "describe-recipe", "--recipe",
+            save(work / "library-shared-policy.json", bad), "--release-contract", contract_file,
+            "--targets", ",".join(matrix)], 4, "release-wide library refused by independent contract")
+    policy = dict(schema_version=1, repo=repo, tag=tag, source_sha=pin, builder=builder, targets=matrix, recipes=[selected])
+    script = work / "native-install.sh"
+    invoke([root / "dsr", "--json", "installer", "generate-release", "--policy", save(work / "native-policy.json", policy),
+            "--public-key", public, "--output", script], label="public library installer generation")
+    result = invoke(["bash", script, "--snapshot", snapshot, "--prefix", prefix, "--replace"],
+                    label="generated library installer rollback")
+    check("generated installer reauthenticates and reactivates the complete earlier generation",
+          result.returncode == 0 and json.loads(result.stdout)["generation"] == first["generation"] and execute() == "1")
+    library.write_bytes(b"damaged installed library")
+    corrupt = data_state(prefix)
+    install("library-retained-drift", snapshot, selected, prefix, 7, policy_targets=matrix)
+    check("changed retained library cannot be reused silently", data_state(prefix) == corrupt)
+
+
+if os.environ.get("DSR_INSTALL_DATA_ONLY") != "1":
+    runtime_library_cases()
+if os.environ.get("DSR_INSTALL_LIBRARIES_ONLY") == "1":
+    print("Results: %d passed, %d failed\nEvidence: %s" % (passed, failed, work), flush=True)
+    sys.exit(1 if failed else 0)
 runtime_data_cases()
 if os.environ.get("DSR_INSTALL_DATA_ONLY") == "1":
     print("Results: %d passed, %d failed\nEvidence: %s" % (passed, failed, work), flush=True)
